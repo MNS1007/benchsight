@@ -11,7 +11,8 @@ from benchsight import track
 from benchsight.feed import LiveFeed
 
 W, H, S = 640, 480, 60  # frame size and square side
-VIT = track.model_path("vittrack", allow_download=False)
+# VitTrack needs both the cached model and an OpenCV that has TrackerVit (4.9+).
+VIT = track.model_path("vittrack", allow_download=False) if hasattr(cv2, "TrackerVit_create") else None
 BACKENDS = ["mil"] + (["vit"] if VIT else [])
 
 
@@ -95,7 +96,7 @@ def test_any_download_failure_falls_back_to_mil(tmp_path, monkeypatch, err):
     assert list(tmp_path.iterdir()) == [], "nothing half-written is left behind"
 
 
-@pytest.mark.skipif(not VIT, reason="VitTrack model not cached")
+@pytest.mark.skipif(not VIT, reason="VitTrack model not cached or TrackerVit missing")
 def test_vit_is_preferred_when_cached():
     assert track.make_backend("auto", allow_download=False, model_dir=VIT.parent).name == "vit"
 

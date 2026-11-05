@@ -100,7 +100,10 @@ def main() -> None:
     p.add_argument("--objects", default="0,1,4,8")
     a = p.parse_args()
     backends = [b for b in a.backends.split(",") if b]
-    if "vit" in backends and not track.model_path("vittrack", allow_download=False):
+    if "vit" in backends and not hasattr(cv2, "TrackerVit_create"):
+        print(f"OpenCV {cv2.__version__} has no TrackerVit; skipping vit")
+        backends.remove("vit")
+    elif "vit" in backends and not track.model_path("vittrack", allow_download=False):
         print("VitTrack model not cached; skipping vit (run the server once online to fetch it)")
         backends.remove("vit")
     print(f"{platform.platform()} | {platform.processor() or platform.machine()} | OpenCV {cv2.__version__}")
