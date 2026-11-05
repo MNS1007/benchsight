@@ -56,6 +56,8 @@ REACQUIRE_EVERY = 5  # frames between searches for each lost object
 MIN_INLIERS = 10  # ORB matches agreeing on one placement to accept a re-found object
 MIN_MATCH = 0.65  # template-matching score to accept one
 MERGE_IOU = 0.3  # overlap needed to merge a box whose label only shares a word
+MOTION_SIDE = 320  # camera motion is estimated at this size: 3x cheaper than 640, and enough
+MIL_WINDOW = 15.0  # MIL's search radius in px (OpenCV's default 25 costs 34 ms an update, this 19)
 IDLE_PERIOD = 0.5  # with nothing tracked, camera motion and events run at 2 Hz only
 COMPENSATE = 0.3  # re-init a tracker when camera motion moved its box this share of its size
 STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "is", "with", "for"}
@@ -114,7 +116,9 @@ class Backend:
                 return cv2.TrackerVit_create(p)
             finally:
                 cv2.utils.logging.setLogLevel(level)
-        return cv2.TrackerMIL_create()
+        p = cv2.TrackerMIL_Params()
+        p.samplerSearchWinSize = MIL_WINDOW
+        return cv2.TrackerMIL_create(p)
 
     def score(self, tracker) -> float | None:
         return float(tracker.getTrackingScore()) if self.name == "vit" else None
@@ -304,7 +308,7 @@ class Tracker:
         self.error = ""
         self._t: float | None = None  # time of the last step, for decay
         self.changes: deque[dict] = deque(maxlen=200)  # object_lost/found/pruned, newest last
-        self.cam = motion.CameraMotion()
+        self.cam = motion.CameraMotion(max_side=min(MOTION_SIDE, max_side))
         self.motion = motion.Motion(confidence=1.0)  # the camera's motion on the last step
         self._idle_t: float | None = None  # last idle step that measured motion
         self._skipped = False  # an idle step skipped motion, so self.cam's last frame is old

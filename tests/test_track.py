@@ -379,3 +379,15 @@ def test_idle_tracker_measures_motion_at_2_hz_and_still_wakes_on_a_bump(tmp_path
         t.step(f, now=now + 0.1 + k / 15)
     assert len(calls) == n + 5
     assert iou(get(t, "servo")["box"], sc.box(250, shift=(60, 30))) > 0.8
+
+
+def test_cheaper_settings_mil_window_and_motion_size():
+    """MIL searches a smaller window and camera motion runs at 320 px, to save CPU."""
+    sc, t = Scene(), tracker("mil")
+    assert t.cam.max_side == track.MOTION_SIDE
+    sc_box = sc.box(200)
+    t.add([{"label": "servo", "box": sc_box}], frame=sc.frame(200))
+    t.step(sc.frame(200))
+    t.step(sc.frame(200, shift=(30, 0)))  # measured at 320 px, reported in tracking pixels
+    assert abs(t.motion.M[0, 2] - 30) < 2
+    assert track.MIL_WINDOW < cv2.TrackerMIL_Params().samplerSearchWinSize
