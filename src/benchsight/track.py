@@ -5,6 +5,12 @@ box. Here one small OpenCV tracker per object follows that box on the live feed,
 640 px. VitTrack (one ONNX file under 1 MB, downloaded once into ~/.cache/benchsight/models
 and checked against a pinned sha256) is preferred; TrackerMIL, which needs no file, is the
 fallback when offline. Boxes are fractions 0-1 of the frame, as in every other tool.
+
+Objects are remembered like in a scene graph: a new box whose label shares a word with a
+nearby object's ("slider plate" next to "white plate") merges into that object's id, shown
+boxes are smoothed, and lost objects keep their last box while their confidence decays.
+
+Registry ideas adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex)
 """
 from __future__ import annotations
 
@@ -15,7 +21,8 @@ import tempfile
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -35,6 +42,11 @@ MAX_OBJECTS = 8
 LOST_AFTER = 3  # bad frames in a row before an object is marked lost
 VIT_MIN_SCORE = 0.3
 MIN_LIKENESS = 0.3  # MIL gives no score: compare the box to the agent's crop instead
+ALPHA = 0.3  # EMA weight of the newest box, so drawn boxes don't jitter
+DECAY = 0.015  # confidence lost per second while an object is not seen
+STALE_BELOW = 0.5  # lost for ~33 s: shown as stale
+PRUNE_BELOW = 0.2  # lost for ~53 s: forgotten
+STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "is", "with", "for"}
 
 
 # ── model files ─────────────────────────────────────────────────────────────
@@ -180,6 +192,31 @@ class TrackedObject:
                 "last_seen": round(self.last_seen, 2), "backend": backend}
 
 
+def _label_words(label: str) -> set[str]:
+    """Significant words of a label: 'M3 screw_2' -> {'screw'}."""
+    words = re.split(r"[^a-z0-9]+", label.lower())
+    return {w for w in words if len(w) > 2 and not w.isdigit() and w not in STOPWORDS}
+
+
+def labels_match(a: str, b: str) -> bool:
+    """Exact, substring, or a shared root word ('slider plate' ~ 'white plate')."""
+    a, b = a.lower().strip(), b.lower().strip()
+    return (a == b or (len(a) > 3 and a in b) or (len(b) > 3 and b in a)
+            or bool(_label_words(a) & _label_words(b)))
+
+
+def _near(a, b) -> float | None:
+    """Center distance of two fractional boxes if they are close enough to be the same
+    object (within 0.75 of the larger box's longer side, at least 0.1), else None."""
+    d = float(np.hypot((a[0] + a[2] - b[0] - b[2]) / 2, (a[1] + a[3] - b[1] - b[3]) / 2))
+    reach = max(0.1, 0.75 * max(a[2] - a[0], a[3] - a[1], b[2] - b[0], b[3] - b[1]))
+    return d if d <= reach else None
+
+
+def _ema(old, new, alpha: float = ALPHA) -> list[float]:
+    return [o * (1 - alpha) + n * alpha for o, n in zip(old, new)]
+
+
 def _slug(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40] or "object"
 
@@ -202,6 +239,8 @@ class Tracker:
         self._thread: threading.Thread | None = None
         self.steps = 0
         self.error = ""
+        self._t: float | None = None  # time of the last step, for decay
+        self.changes: deque[dict] = deque(maxlen=200)  # object_lost / object_pruned, newest last
 
     # ── frames ──
 
@@ -220,6 +259,8 @@ class Tracker:
             ref = self._small(frame) if frame is not None else self._last
             if ref is None:
                 raise ValueError("no camera frame yet; open the viewer or take a look first")
+            if self._last is not None and ref.shape != self._last.shape:  # keep one pixel space
+                ref = cv2.resize(ref, (self._last.shape[1], self._last.shape[0]), interpolation=cv2.INTER_AREA)
             items = [(str(o.get("label") or o.get("id") or "object")[:60], check_box(o.get("box")), o.get("id"))
                      for o in objects]
             now = self.clock()
@@ -227,7 +268,7 @@ class Tracker:
             g = motion.gray(ref)
             out, keep = [], set()
             for label, box, oid in items:
-                obj = self._match(oid, label, box)
+                obj = self._match(oid, label, box, w, h)
                 if obj is None:
                     self._make_room()
                     obj = TrackedObject(self._new_id(oid or label), label, [], [], g, first_seen=now)
@@ -268,12 +309,44 @@ class Tracker:
             oid, n = f"{base}-{n}", n + 1
         return oid
 
-    def _match(self, oid, label, box):
-        return self._objs.get(oid) if oid else None
+    def _match(self, oid, label, box, w, h) -> TrackedObject | None:
+        """The object a new box belongs to: the same id if given, else the nearest object
+        with a matching label (as VISTA's scene graph merges repeat sightings)."""
+        if oid:
+            return self._objs.get(oid)
+        best, best_d = None, None
+        for obj in self._objs.values():
+            if not labels_match(label, obj.label):
+                continue
+            d = _near(box, _to_frac(obj.box, w, h))
+            if d is not None and (best_d is None or d < best_d):
+                best, best_d = obj, d
+        return best
 
     def _make_room(self) -> None:
-        if len(self._objs) >= self.max_objects:
+        """Forget the least confident lost object if full; refuse if all are tracking."""
+        if len(self._objs) < self.max_objects:
+            return
+        idle = [o for o in self._objs.values() if o.status != "tracking"]
+        if not idle:
             raise ValueError(f"already tracking {self.max_objects} objects; untrack some first")
+        del self._objs[min(idle, key=lambda o: o.confidence).id]
+
+    def _note(self, event: str, obj: TrackedObject, now: float) -> None:
+        self.changes.append({"event": event, "id": obj.id, "label": obj.label, "t": round(now, 2)})
+
+    def _decay(self, now: float) -> None:
+        dt = 0.0 if self._t is None else max(0.0, now - self._t)
+        self._t = now
+        for obj in list(self._objs.values()):
+            if obj.status == "tracking":
+                continue
+            obj.confidence = max(0.0, obj.confidence - DECAY * dt)
+            if obj.confidence < PRUNE_BELOW:
+                del self._objs[obj.id]
+                self._note("object_pruned", obj, now)
+            elif obj.confidence < STALE_BELOW:
+                obj.status = "stale"
 
     def _init(self, obj: TrackedObject, small: np.ndarray, box_px, now: float) -> None:
         h, w = small.shape[:2]
@@ -306,12 +379,13 @@ class Tracker:
                 good = score >= VIT_MIN_SCORE
         if good:
             obj.raw, obj.score, obj.bad = new, float(score), 0
-            obj.box = list(new)
+            obj.box = _ema(obj.box, new)
             obj.last_seen, obj.confidence = now, 1.0
             return
         obj.bad += 1
         if obj.bad >= LOST_AFTER:
             obj.status, obj.tracker = "lost", None
+            self._note("object_lost", obj, now)
 
     def step(self, frame: np.ndarray, now: float | None = None) -> None:
         """Track every object on one frame (full size; it is downscaled here)."""
@@ -324,6 +398,7 @@ class Tracker:
             for obj in list(self._objs.values()):
                 if obj.status == "tracking" and obj.tracker is not None:
                     self._update(obj, small, g, now)
+            self._decay(now)
             self.steps += 1
 
     # ── thread ──

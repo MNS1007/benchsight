@@ -161,3 +161,61 @@ def test_thread_tracks_a_live_feed():
         t.stop()
         feed.stop()
     assert not t.running
+
+
+# ── object registry: merging, smoothing, decay ──
+
+def test_labels_match_by_word_not_by_accident():
+    assert track.labels_match("slider plate", "white plate")
+    assert track.labels_match("servo", "servo_2") and track.labels_match("M3 screw", "screw")
+    assert not track.labels_match("servo", "screw") and not track.labels_match("the arm", "the base")
+
+
+def test_duplicate_labels_near_each_other_merge():
+    sc, t = Scene(), tracker("mil")
+    f = sc.frame(200)
+    first = t.add([{"label": "white plate", "box": sc.box(200)}], frame=f)
+    near = [(200 + 6) / W, 205 / H, (200 + S + 6) / W, (205 + S) / H]
+    again = t.add([{"label": "slider plate", "box": near}], frame=f)
+    assert again[0]["id"] == first[0]["id"] == "white-plate"
+    assert [o["label"] for o in t.objects()] == ["slider plate"], "one object, with the newest label"
+    t.add([{"label": "slider plate", "box": [0.8, 0.05, 0.9, 0.15]}], frame=f)  # same word, far away
+    t.add([{"label": "servo", "box": near}], frame=f)  # near, different word
+    assert sorted(o["id"] for o in t.objects()) == ["servo", "slider-plate", "white-plate"]
+
+
+def test_drawn_boxes_are_smoothed():
+    sc, t = Scene(), tracker("mil")
+    t.add([{"label": "servo", "box": sc.box(200)}], frame=sc.frame(200))
+    t.step(sc.frame(212))
+    x = get(t, "servo")["box"][0] * W
+    assert 200 < x < 208, "the shown box moves about 30% of the way to the new spot"
+
+
+def test_lost_objects_decay_go_stale_and_are_pruned():
+    sc, clock = Scene(), {"t": 1000.0}
+    t = tracker("mil", clock=lambda: clock["t"])
+    t.add([{"label": "servo", "box": sc.box(200)}], frame=sc.frame(200))
+    for _ in range(track.LOST_AFTER):
+        t.step(sc.frame(None), now=clock["t"])
+    assert get(t, "servo")["status"] == "lost"
+    t.step(sc.frame(None), now=1020.0)  # 20 s: confidence 1 - 0.3
+    o = get(t, "servo")
+    assert o["status"] == "lost" and abs(o["confidence"] - 0.7) < 0.01
+    t.step(sc.frame(None), now=1040.0)
+    assert get(t, "servo")["status"] == "stale"
+    t.step(sc.frame(None), now=1060.0)
+    assert t.objects() == []
+    assert [c["event"] for c in t.changes] == ["object_lost", "object_pruned"]
+
+
+def test_at_most_eight_objects_and_lost_ones_make_room():
+    sc, t = Scene(), tracker("mil", max_objects=3)
+    f = sc.frame(None)
+    t.add([{"id": f"o{i}", "label": f"part{i}", "box": [0.1 + 0.25 * i, 0.1, 0.2 + 0.25 * i, 0.2]} for i in range(3)], frame=f)
+    with pytest.raises(ValueError, match="already tracking 3"):
+        t.add([{"label": "extra", "box": [0.5, 0.6, 0.6, 0.7]}], frame=f)
+    t._objs["o1"].status, t._objs["o1"].confidence = "lost", 0.6
+    t.add([{"label": "extra", "box": [0.5, 0.6, 0.6, 0.7]}], frame=f)
+    assert sorted(o["id"] for o in t.objects()) == ["extra", "o0", "o2"]
+    assert track.Tracker(backend=track.Backend("mil")).max_objects == 8
