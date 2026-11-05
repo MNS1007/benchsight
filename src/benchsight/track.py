@@ -435,12 +435,11 @@ class Tracker:
         new = [float(x), float(y), float(x + bw), float(y + bh)]
         score = self.backend.score(obj.tracker)
         good = bool(ok) and self._plausible(obj.raw, new)
-        if good:
-            like = likeness(g, new, obj.template)
-            if score is None:
-                score, good = like, like >= MIN_LIKENESS
-            else:
-                good = score >= VIT_MIN_SCORE
+        if good and score is None:  # MIL: judge by likeness to the agent's crop
+            score = likeness(g, new, obj.template)
+            good = score >= MIN_LIKENESS
+        elif good:
+            good = score >= VIT_MIN_SCORE
         if good:
             obj.raw, obj.score, obj.bad = new, float(score), 0
             obj.box = _ema(obj.box, new)
