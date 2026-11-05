@@ -56,6 +56,7 @@ REACQUIRE_EVERY = 5  # frames between searches for each lost object
 MIN_INLIERS = 10  # ORB matches agreeing on one placement to accept a re-found object
 MIN_MATCH = 0.65  # template-matching score to accept one
 MERGE_IOU = 0.3  # overlap needed to merge a box whose label only shares a word
+IDLE_PERIOD = 0.5  # with nothing tracked, camera motion and events run at 2 Hz only
 COMPENSATE = 0.3  # re-init a tracker when camera motion moved its box this share of its size
 STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "is", "with", "for"}
 
@@ -305,6 +306,8 @@ class Tracker:
         self.changes: deque[dict] = deque(maxlen=200)  # object_lost/found/pruned, newest last
         self.cam = motion.CameraMotion()
         self.motion = motion.Motion(confidence=1.0)  # the camera's motion on the last step
+        self._idle_t: float | None = None  # last idle step that measured motion
+        self._skipped = False  # an idle step skipped motion, so self.cam's last frame is old
 
     # ── frames ──
 
@@ -519,6 +522,15 @@ class Tracker:
                 self.cam.reset()
             self._last = small
             self._size = (small.shape[1], small.shape[0])
+            if not self._objs:  # idle: only scene events need motion, and 2 Hz is enough
+                if self._idle_t is not None and 0 <= now - self._idle_t < IDLE_PERIOD:
+                    self._skipped = True
+                    self.steps += 1
+                    return
+                self._idle_t = now
+            elif self._skipped:  # tracking again: don't apply motion measured from an old frame
+                self.cam.reset()
+                self._skipped, self._idle_t = False, None
             self._compensate(small, g, now)
             for obj in list(self._objs.values()):
                 if obj.status == "tracking" and obj.tracker is not None:

@@ -1,6 +1,7 @@
 """Tracking on a synthetic video: a textured square moving over a noisy background.
 No camera and no network. MIL is always tested; VitTrack only if its model is cached."""
 import http.client
+import json
 import time
 
 import cv2
@@ -346,3 +347,35 @@ def test_lost_boxes_move_with_the_camera():
     t.step(sc.frame(None, shift=(30, 0)))
     after = get(t, "servo")["box"]
     assert get(t, "servo")["status"] == "lost" and abs((after[0] - before[0]) * W - 30) < 3
+
+
+def test_idle_tracker_measures_motion_at_2_hz_and_still_wakes_on_a_bump(tmp_path):
+    """With nothing tracked, camera motion and events run at 2 Hz, not every frame, but a
+    camera bump is still reported."""
+    from benchsight import events
+    sc = Scene()
+    ev = events.Events(tmp_path / "e.jsonl")
+    t = tracker("mil", events=ev)
+    calls = []
+    update = t.cam.update
+    t.cam.update = lambda *a, **k: calls.append(1) or update(*a, **k)
+    frames = [sc.frame(200) for _ in range(15)]
+    frames += [sc.frame(200, shift=(4 * i, 2 * i)) for i in range(1, 16)]  # the camera slides
+    frames += [sc.frame(200, shift=(60, 30)) for _ in range(8 * 15)]  # and stays
+    for i, f in enumerate(frames):
+        t.step(f, now=i / 15)
+    secs = len(frames) / 15
+    assert t.steps == len(frames) and len(calls) <= 2 * secs + 1, len(calls)
+    got = [json.loads(ln)["event"] for ln in (tmp_path / "e.jsonl").read_text().splitlines()]
+    assert got[0] == "scene_changed", got
+
+    # Tracking starts: motion runs every frame, and nothing old is applied to the new box.
+    now = len(frames) / 15
+    t.step(sc.frame(200, shift=(60, 30)), now=now + 0.05)  # skipped: under 0.5 s since the last
+    f = sc.frame(250, shift=(60, 30))
+    t.add([{"label": "servo", "box": sc.box(250, shift=(60, 30))}], frame=f)
+    n = len(calls)
+    for k in range(5):
+        t.step(f, now=now + 0.1 + k / 15)
+    assert len(calls) == n + 5
+    assert iou(get(t, "servo")["box"], sc.box(250, shift=(60, 30))) > 0.8
