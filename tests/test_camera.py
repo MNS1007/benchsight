@@ -36,8 +36,8 @@ def test_save_writes_a_jpeg(tmp_path):
     assert shot.path.exists() and shot.jpeg[:2] == b"\xff\xd8"
 
 
-def test_server_registers_the_four_tools():
+def test_server_registers_the_tools():
     import asyncio
     from benchsight import server
     tools = asyncio.run(server.mcp.list_tools())
-    assert {t.name for t in tools} == {"cameras", "look", "watch", "point"}
+    assert {t.name for t in tools} == {"cameras", "look", "watch", "point", "open_viewer", "annotate", "clear_annotations", "close_viewer"}
