@@ -18,7 +18,7 @@ BACKENDS = ["mil"] + (["vit"] if VIT else [])
 def one_cv_thread():
     n = cv2.getNumThreads()
     cv2.setNumThreads(1)
-    cv2.setRNGSeed(0)  # MIL samples at random; keep runs repeatable
+    cv2.setRNGSeed(0)  # pins OpenCV RNG users; MIL stays nondeterministic, so tests allow for it
     yield
     cv2.setNumThreads(n)
 
