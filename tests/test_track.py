@@ -28,6 +28,9 @@ class Scene:
         rng = np.random.default_rng(seed)
         self.rng = rng
         self.bg = cv2.GaussianBlur(rng.integers(0, 255, (H, W, 3), dtype=np.uint8), (0, 0), 3)
+        for _ in range(30):  # bench clutter, so the camera's own motion can be measured
+            x, y, c = int(rng.integers(0, W - 30)), int(rng.integers(0, H - 30)), [int(v) for v in rng.integers(0, 255, 3)]
+            cv2.rectangle(self.bg, (x, y), (x + int(rng.integers(8, 30)), y + int(rng.integers(8, 30))), c, -1)
         tex = rng.integers(0, 255, (S // 6, S // 6, 3), dtype=np.uint8)
         self.tex = cv2.resize(tex, (S, S), interpolation=cv2.INTER_NEAREST)  # blocky, high contrast
         cv2.rectangle(self.tex, (0, 0), (S - 1, S - 1), (255, 255, 255), 3)
@@ -184,12 +187,40 @@ def test_duplicate_labels_near_each_other_merge():
     assert sorted(o["id"] for o in t.objects()) == ["servo", "slider-plate", "white-plate"]
 
 
+class Scripted(track.Backend):
+    """A stand-in tracker that reports whatever box the test sets, to test the registry
+    without a real tracker's noise."""
+
+    def __init__(self):
+        super().__init__("scripted")
+        self.rect = None
+
+    def create(self):
+        backend = self
+
+        class T:
+            def init(self, frame, rect):
+                backend.rect = rect
+
+            def update(self, frame):
+                return True, backend.rect
+
+        return T()
+
+    def score(self, tracker):
+        return 1.0
+
+
 def test_drawn_boxes_are_smoothed():
-    sc, t = Scene(), tracker("mil")
+    sc, b = Scene(), Scripted()
+    t = track.Tracker(backend=b)
     t.add([{"label": "servo", "box": sc.box(200)}], frame=sc.frame(200))
-    t.step(sc.frame(212))
-    x = get(t, "servo")["box"][0] * W
-    assert 200 < x < 208, "the shown box moves about 30% of the way to the new spot"
+    b.rect = (210, 200, S, S)
+    t.step(sc.frame(210))
+    assert abs(get(t, "servo")["box"][0] * W - 203) < 0.5, "the shown box moves 30% of the way to the new spot"
+    for _ in range(15):
+        t.step(sc.frame(210))
+    assert abs(get(t, "servo")["box"][0] * W - 210) < 0.5
 
 
 def test_lost_objects_decay_go_stale_and_are_pruned():
@@ -219,3 +250,63 @@ def test_at_most_eight_objects_and_lost_ones_make_room():
     t.add([{"label": "extra", "box": [0.5, 0.6, 0.6, 0.7]}], frame=f)
     assert sorted(o["id"] for o in t.objects()) == ["extra", "o0", "o2"]
     assert track.Tracker(backend=track.Backend("mil")).max_objects == 8
+
+
+# ── re-finding lost objects and following the camera ──
+
+def test_find_locates_the_template_near_then_anywhere():
+    sc = Scene()
+    g0 = cv2.cvtColor(sc.frame(100), cv2.COLOR_BGR2GRAY)
+    tpl = g0[200:200 + S, 100:100 + S].copy()
+    kp, des = track.motion.orb_features(tpl, orb=track.motion.ORB_SMALL)
+    g = cv2.cvtColor(sc.frame(450, y=80), cv2.COLOR_BGR2GRAY)
+    for k, d in [(kp, des), ((), None)]:  # ORB, then template matching alone
+        box = track.find(g, tpl, k, d, near=[100, 200, 160, 260])
+        assert box is not None and iou(box, [450, 80, 510, 140]) > 0.7, box
+    assert track.find(cv2.cvtColor(sc.frame(None), cv2.COLOR_BGR2GRAY), tpl, kp, des) is None
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_refound_when_it_reappears(backend):
+    sc, t = Scene(), tracker(backend)
+    t.add([{"label": "servo", "box": sc.box(150)}], frame=sc.frame(150))
+    for _ in range(track.LOST_AFTER + 1):
+        t.step(sc.frame(None))
+    assert get(t, "servo")["status"] == "lost"
+    for _ in range(2 * track.REACQUIRE_EVERY):  # back, somewhere else
+        t.step(sc.frame(420, y=100))
+        if get(t, "servo")["status"] == "tracking":
+            break
+    o = get(t, "servo")
+    assert o["status"] == "tracking" and iou(o["box"], sc.box(420, y=100)) > 0.5, o
+    assert [c["event"] for c in t.changes] == ["object_lost", "object_found"]
+    for x in range(420, 460, 5):  # and keeps following
+        t.step(sc.frame(x, y=100))
+    assert iou(get(t, "servo")["box"], sc.box(455, y=100)) > 0.5
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_boxes_follow_when_the_camera_is_bumped(backend):
+    """A 40 px jump of the whole frame is beyond MIL's search radius; the camera-motion
+    estimate moves the box first."""
+    sc, t = Scene(), tracker(backend)
+    t.add([{"label": "servo", "box": sc.box(250)}], frame=sc.frame(250))
+    for _ in range(3):
+        t.step(sc.frame(250))
+    t.step(sc.frame(250, shift=(40, 25)))
+    assert t.motion.confidence > 0.5 and abs(t.motion.M[0, 2] - 40) < 2 and abs(t.motion.M[1, 2] - 25) < 2
+    for _ in range(3):
+        t.step(sc.frame(250, shift=(40, 25)))
+    o = get(t, "servo")
+    assert o["status"] == "tracking" and iou(o["box"], sc.box(250, shift=(40, 25))) > 0.5, o
+
+
+def test_lost_boxes_move_with_the_camera():
+    sc, t = Scene(), tracker("mil")
+    t.add([{"label": "servo", "box": sc.box(250)}], frame=sc.frame(250))
+    for _ in range(track.LOST_AFTER + 1):
+        t.step(sc.frame(None))
+    before = get(t, "servo")["box"]
+    t.step(sc.frame(None, shift=(30, 0)))
+    after = get(t, "servo")["box"]
+    assert get(t, "servo")["status"] == "lost" and abs((after[0] - before[0]) * W - 30) < 3

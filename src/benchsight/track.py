@@ -6,6 +6,11 @@ box. Here one small OpenCV tracker per object follows that box on the live feed,
 and checked against a pinned sha256) is preferred; TrackerMIL, which needs no file, is the
 fallback when offline. Boxes are fractions 0-1 of the frame, as in every other tool.
 
+A lost object is looked for again every few frames: its crop from the agent's frame is
+matched with ORB (falling back to template matching for plain parts) near its last box,
+then in the whole frame. When the whole frame shifts (the laptop is bumped), the camera's
+motion is applied to every box first and the trackers refine from there.
+
 Objects are remembered like in a scene graph: a new box whose label shares a word with a
 nearby object's ("slider plate" next to "white plate") merges into that object's id, shown
 boxes are smoothed, and lost objects keep their last box while their confidence decays.
@@ -46,6 +51,10 @@ ALPHA = 0.3  # EMA weight of the newest box, so drawn boxes don't jitter
 DECAY = 0.015  # confidence lost per second while an object is not seen
 STALE_BELOW = 0.5  # lost for ~33 s: shown as stale
 PRUNE_BELOW = 0.2  # lost for ~53 s: forgotten
+REACQUIRE_EVERY = 5  # frames between searches for each lost object
+MIN_INLIERS = 10  # ORB matches agreeing on one placement to accept a re-found object
+MIN_MATCH = 0.65  # template-matching score to accept one
+COMPENSATE = 0.3  # re-init a tracker when camera motion moved its box this share of its size
 STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "is", "with", "for"}
 
 
@@ -171,6 +180,51 @@ def likeness(g: np.ndarray, box, template: np.ndarray, pad: float = 0.25, side: 
     return float(cv2.matchTemplate(region, tpl, cv2.TM_CCOEFF_NORMED).max())
 
 
+def _find_in(region: np.ndarray, template: np.ndarray, kp, des) -> list[float] | None:
+    th, tw = template.shape[:2]
+    if des is not None and len(kp) >= MIN_INLIERS:  # ORB: survives rotation and scale
+        kp2, des2 = motion.orb_features(region, orb=motion.ORB_SMALL)
+        M, _ = motion.affine_from_points(*motion.orb_match(kp, des, kp2, des2), min_points=MIN_INLIERS)
+        if M is not None and 0.5 <= float(np.hypot(M[0, 0], M[1, 0])) <= 2.0:
+            return motion.apply(M, [0, 0, tw, th])
+    f = 0.5 if min(tw, th) >= 24 else 1.0  # plain parts: multi-scale template matching
+    reg = cv2.resize(region, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f != 1 else region
+    best = (MIN_MATCH, None)
+    for sc in (0.8, 1.0, 1.25):
+        t = cv2.resize(template, (max(4, round(tw * sc * f)), max(4, round(th * sc * f))), interpolation=cv2.INTER_AREA)
+        if t.shape[0] > reg.shape[0] or t.shape[1] > reg.shape[1]:
+            continue
+        _, val, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(reg, t, cv2.TM_CCOEFF_NORMED))
+        if val > best[0]:
+            best = (val, [x / f, y / f, (x + t.shape[1]) / f, (y + t.shape[0]) / f])
+    return best[1]
+
+
+def find(g: np.ndarray, template: np.ndarray, kp=None, des=None, near=None, full: bool = True) -> list[float] | None:
+    """Where the template is in grayscale frame g, as a pixel box, or None. Searches a
+    window around `near` (a pixel box) first, then (if full) the whole frame."""
+    h, w = g.shape[:2]
+    regions = []
+    if near is not None:
+        bw, bh = near[2] - near[0], near[3] - near[1]
+        regions.append(_clip([near[0] - 1.5 * bw, near[1] - 1.5 * bh, near[2] + 1.5 * bw, near[3] + 1.5 * bh], w, h))
+    if full or near is None:
+        regions.append([0, 0, w, h])
+    for rx1, ry1, rx2, ry2 in regions:
+        box = _find_in(g[ry1:ry2, rx1:rx2], template, kp, des)
+        if box is not None:
+            return [box[0] + rx1, box[1] + ry1, box[2] + rx1, box[3] + ry1]
+    return None
+
+
+def _iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
 @dataclass
 class TrackedObject:
     id: str
@@ -185,6 +239,9 @@ class TrackedObject:
     first_seen: float = 0.0
     last_seen: float = 0.0
     bad: int = 0  # bad frames in a row
+    kp: tuple = ()  # ORB features of the template, for re-acquiring
+    des: np.ndarray | None = None
+    tries: int = 0  # steps since the object was lost
 
     def snapshot(self, w: int, h: int, backend: str) -> dict:
         return {"id": self.id, "label": self.label, "box": [round(v, 4) for v in _to_frac(self.box, w, h)],
@@ -240,7 +297,9 @@ class Tracker:
         self.steps = 0
         self.error = ""
         self._t: float | None = None  # time of the last step, for decay
-        self.changes: deque[dict] = deque(maxlen=200)  # object_lost / object_pruned, newest last
+        self.changes: deque[dict] = deque(maxlen=200)  # object_lost/found/pruned, newest last
+        self.cam = motion.CameraMotion()
+        self.motion = motion.Motion(confidence=1.0)  # the camera's motion on the last step
 
     # ── frames ──
 
@@ -348,10 +407,15 @@ class Tracker:
             elif obj.confidence < STALE_BELOW:
                 obj.status = "stale"
 
-    def _init(self, obj: TrackedObject, small: np.ndarray, box_px, now: float) -> None:
+    def _init(self, obj: TrackedObject, small: np.ndarray, box_px, now: float, template: bool = True) -> None:
+        """(Re)start the object's tracker at box_px. template=False keeps the agent's crop
+        (re-acquire and camera compensation must not replace it with what is there now)."""
         h, w = small.shape[:2]
         x1, y1, x2, y2 = _clip(box_px, w, h)
-        obj.template = motion.gray(small)[y1:y2, x1:x2].copy()
+        if template:
+            obj.template = motion.gray(small)[y1:y2, x1:x2].copy()
+            obj.kp, obj.des = motion.orb_features(obj.template, orb=motion.ORB_SMALL)
+        obj.tries = 0
         obj.tracker = self.backend.create()
         obj.tracker.init(small, (x1, y1, x2 - x1, y2 - y1))
         obj.raw, obj.box = [x1, y1, x2, y2], [float(v) for v in (x1, y1, x2, y2)]
@@ -382,10 +446,55 @@ class Tracker:
             obj.box = _ema(obj.box, new)
             obj.last_seen, obj.confidence = now, 1.0
             return
+        # A tracker that slipped off (MIL drifts) but the object is still close by: snap
+        # back with a local search instead of counting a bad frame.
+        near = find(g, obj.template, obj.kp, obj.des, near=obj.raw, full=False)
+        if near is not None and self._plausible(obj.raw, near):
+            shown = obj.box
+            self._init(obj, small, near, now, template=False)
+            obj.box = _ema(shown, near)
+            return
         obj.bad += 1
         if obj.bad >= LOST_AFTER:
             obj.status, obj.tracker = "lost", None
             self._note("object_lost", obj, now)
+
+    def _compensate(self, small: np.ndarray, g: np.ndarray, now: float) -> None:
+        """Estimate how the whole frame moved, leaving tracked objects out, and move every
+        box with it. OpenCV trackers can't be told to shift their search window, so a
+        tracker is re-initialized at its moved box only when the shift is large for it;
+        small shifts are left to the tracker to refine."""
+        mask = np.full(g.shape, 255, np.uint8)
+        for obj in self._objs.values():
+            if obj.status == "tracking":
+                x1, y1, x2, y2 = obj.raw
+                px, py = 0.2 * (x2 - x1), 0.2 * (y2 - y1)
+                mask[max(0, int(y1 - py)):max(0, int(y2 + py)), max(0, int(x1 - px)):max(0, int(x2 + px))] = 0
+        m = self.motion = self.cam.update(g, mask)
+        if m.confidence < 0.5 or m.magnitude < 1.0:
+            return
+        for obj in self._objs.values():
+            moved = motion.apply(m.M, obj.raw)
+            obj.box = motion.apply(m.M, obj.box)
+            if obj.status != "tracking" or obj.tracker is None:
+                obj.raw = moved
+                continue
+            shift = np.hypot(moved[0] - obj.raw[0], moved[1] - obj.raw[1])
+            if shift > COMPENSATE * min(obj.raw[2] - obj.raw[0], obj.raw[3] - obj.raw[1]):
+                shown = obj.box
+                self._init(obj, small, moved, now, template=False)
+                obj.box = shown
+
+    def _reacquire(self, obj: TrackedObject, small: np.ndarray, g: np.ndarray, now: float) -> None:
+        obj.tries += 1
+        if obj.tries % REACQUIRE_EVERY:
+            return
+        box = find(g, obj.template, obj.kp, obj.des, near=obj.raw)
+        if box is None or any(o is not obj and o.status == "tracking" and _iou(box, o.raw) > 0.5
+                              for o in self._objs.values()):
+            return
+        self._init(obj, small, box, now, template=False)
+        self._note("object_found", obj, now)
 
     def step(self, frame: np.ndarray, now: float | None = None) -> None:
         """Track every object on one frame (full size; it is downscaled here)."""
@@ -393,11 +502,16 @@ class Tracker:
         small = self._small(frame)
         g = motion.gray(small)
         with self._lock:
+            if self._last is not None and self._last.shape != small.shape:
+                self.cam.reset()
             self._last = small
             self._size = (small.shape[1], small.shape[0])
+            self._compensate(small, g, now)
             for obj in list(self._objs.values()):
                 if obj.status == "tracking" and obj.tracker is not None:
                     self._update(obj, small, g, now)
+                else:
+                    self._reacquire(obj, small, g, now)
             self._decay(now)
             self.steps += 1
 

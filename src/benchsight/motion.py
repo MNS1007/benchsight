@@ -18,6 +18,8 @@ RATIO = 0.75  # Lowe ratio test
 IDENTITY = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
 _orb = cv2.ORB_create(nfeatures=500)
+# For small template crops (a 60 px part): the default 31 px border and patch leave no keypoints
+ORB_SMALL = cv2.ORB_create(nfeatures=500, edgeThreshold=15, patchSize=15)
 _bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
 
@@ -66,9 +68,9 @@ def affine_from_points(src: np.ndarray, dst: np.ndarray, min_points: int = 6) ->
     return M, n / len(src)
 
 
-def orb_features(img: np.ndarray, mask: np.ndarray | None = None):
+def orb_features(img: np.ndarray, mask: np.ndarray | None = None, orb=None):
     """(keypoints, descriptors) of a grayscale image."""
-    return _orb.detectAndCompute(img, mask)
+    return (orb or _orb).detectAndCompute(img, mask)
 
 
 def orb_match(kp1, des1, kp2, des2) -> tuple[np.ndarray, np.ndarray]:
