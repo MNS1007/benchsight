@@ -2,6 +2,7 @@
 nothing records in the background."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-STORE = Path(".benchsight")
+STORE = Path(os.environ.get("BENCHSIGHT_DIR", ".benchsight"))  # where photos are kept
 KEEP_SECONDS = 24 * 3600  # saved frames older than this are deleted on the next capture
 
 
@@ -98,7 +99,7 @@ def mark(img: np.ndarray, x: float, y: float, text: str = "") -> np.ndarray:
 
 def save(img: np.ndarray, name: str, quality: int = 85, store: Path = STORE) -> Shot:
     """Write a JPEG to the local store (kept 24 hours) and return its bytes."""
-    store.mkdir(exist_ok=True)
+    store.mkdir(parents=True, exist_ok=True)
     now = time.time()
     for old in store.glob("*.jpg"):
         if now - old.stat().st_mtime > KEEP_SECONDS:
