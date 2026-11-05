@@ -16,6 +16,7 @@ import webbrowser
 from mcp.server.mcpserver import Image, MCPServer
 
 from . import camera
+from .events import Events
 from .feed import LiveFeed
 from .overlay import Overlay, render, resolve
 from .track import Tracker, check_box
@@ -30,8 +31,10 @@ _look_boxes: dict[str, list[float]] = {}  # tracked boxes as they were in the la
 
 def _make_tracker(feed) -> Tracker:
     """The object tracker for the live feed. BENCHSIGHT_TRACKER picks the backend:
-    auto (VitTrack, downloaded once, else MIL), vit or mil."""
-    return Tracker(feed, backend=os.environ.get("BENCHSIGHT_TRACKER", "auto"))
+    auto (VitTrack, downloaded once, else MIL), vit or mil. Wake-up events go to
+    <store>/events.jsonl, for `benchsight events --follow`."""
+    return Tracker(feed, backend=os.environ.get("BENCHSIGHT_TRACKER", "auto"),
+                   events=Events(camera.STORE / "events.jsonl"))
 
 
 def _tracker() -> Tracker:

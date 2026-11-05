@@ -284,8 +284,10 @@ class Tracker:
 
     def __init__(self, feed=None, backend: str | Backend = "auto", allow_download: bool = True,
                  max_objects: int = MAX_OBJECTS, max_side: int = motion.MAX_SIDE, fps: float = 15.0,
-                 cv_threads: int | None = 1, clock=time.time):
+                 cv_threads: int | None = 1, clock=time.time, events=None):
+        """events: an events.Events to write wake-ups to (lost, found, scene changes)."""
         self.feed, self.max_objects, self.max_side, self.fps = feed, max_objects, max_side, fps
+        self.events = events
         self.cv_threads, self.clock = cv_threads, clock
         self.backend = backend if isinstance(backend, Backend) else make_backend(backend, allow_download)
         self._objs: dict[str, TrackedObject] = {}
@@ -393,6 +395,8 @@ class Tracker:
 
     def _note(self, event: str, obj: TrackedObject, now: float) -> None:
         self.changes.append({"event": event, "id": obj.id, "label": obj.label, "t": round(now, 2)})
+        if self.events is not None and event in ("object_lost", "object_found"):
+            self.events.add(event, now, id=obj.id, label=obj.label)
 
     def _decay(self, now: float) -> None:
         dt = 0.0 if self._t is None else max(0.0, now - self._t)
@@ -512,6 +516,8 @@ class Tracker:
                 else:
                     self._reacquire(obj, small, g, now)
             self._decay(now)
+            if self.events is not None:
+                self.events.observe(g, self.motion, now)
             self.steps += 1
 
     # ── thread ──
