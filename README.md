@@ -22,6 +22,7 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 - [Add the hardware-help skill (Claude Code)](#add-the-hardware-help-skill-claude-code)
 - [Allow camera access](#allow-camera-access)
 - [Use it](#use-it)
+- [The live viewer](#the-live-viewer)
 - [Settings](#settings)
 - [Privacy](#privacy)
 - [Troubleshooting](#troubleshooting)
@@ -34,14 +35,20 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 
 ## What you get
 
-Four tools the agent can call:
+Tools the agent can call:
 
 | Tool | What it does | Inputs |
 |---|---|---|
 | `cameras` | Lists the cameras that work on this machine | none |
 | `look` | Takes one photo now. It can zoom on a region, like a connector or a servo label | `cam` (default 0), `max_side` (default 1280), and the zoom box `x1, y1, x2, y2` as fractions 0 to 1 (default: whole frame) |
 | `watch` | Takes 2 to 9 photos over a few seconds and returns them as one numbered sheet, for something that moves (a servo sweep, a cable being seated) | `cam`, `seconds` (default 6), `frames` (default 6), `max_side` (default 1600) |
-| `point` | Circles a spot on the last `look` photo with a short label, to show you exactly which pin or cable it means | `x`, `y` as fractions 0 to 1, `label` |
+| `point` | Circles a spot on the last `look` photo with a short label, to show you exactly which pin or cable it means. If the live viewer is open, the circle shows there too | `x`, `y` as fractions 0 to 1, `label` |
+| `open_viewer` | Opens the **live viewer**: a small local window with the camera feed, where the agent's drawings appear on top | `cam`, `open_browser` (default true) |
+| `annotate` | Draws on the live viewer: arrows, circles, boxes, freehand strokes and text, plus a one-line instruction under the video | `shapes` (list), `caption`, `replace` (default true) |
+| `clear_annotations` | Removes all drawings from the viewer | none |
+| `close_viewer` | Closes the viewer and turns the camera off | none |
+
+`look` also takes `with_annotations` (default false). With it, the agent gets the photo with its own drawings on it, so it can check they landed in the right place.
 
 You also get:
 
@@ -163,7 +170,7 @@ Check it:
 claude mcp list           # benchsight should show as connected
 ```
 
-Inside Claude Code, `/mcp` also shows the server and its four tools.
+Inside Claude Code, `/mcp` also shows the server and its tools.
 
 ### Claude Desktop
 
@@ -263,12 +270,48 @@ Tips:
 
 ---
 
+## The live viewer
+
+For step-by-step guidance, the agent can open a live view of your bench and draw on it while you work. For example: "this bracket is the wrong one", "move it here", "route the cable like this".
+
+![The agent's drawings, shown on a test image](docs/viewer-example.png)
+
+*The drawings shown on a test image. On a real bench they appear over the live camera.*
+
+**How it works:**
+1. Ask for it: "Open the viewer and guide me through mounting the gripper."
+2. The agent calls `open_viewer`. A browser tab opens at a local address (like `http://127.0.0.1:53817/`) with the live camera. Keep it beside your bench or on a second screen.
+3. When you ask "what's wrong?", the agent takes a photo, finds the problem, and draws on the live view:
+   - **red** for wrong;
+   - **green** for right;
+   - **yellow** for where to move something;
+   - a short instruction under the video.
+4. The drawings stay on screen until the agent changes them, so you can keep working with both hands.
+5. When you're done, the agent calls `close_viewer` and the camera turns off. Closing the tab alone does not turn the camera off.
+
+**What the agent can draw.** Coordinates are fractions 0 to 1 of the frame, and the color is optional.
+
+```json
+{"type": "arrow",  "from": [0.7, 0.4], "to": [0.35, 0.3], "label": "move it here", "color": "yellow"}
+{"type": "circle", "at": [0.3, 0.55], "r": 0.04, "label": "screw 2"}
+{"type": "box",    "box": [0.59, 0.41, 0.82, 0.63], "label": "wrong bracket"}
+{"type": "path",   "points": [[0.2, 0.75], [0.3, 0.85], [0.45, 0.8]], "label": "cable route", "color": "green"}
+{"type": "text",   "at": [0.6, 0.6], "text": "flip it over"}
+```
+
+The drawings are fixed to the camera image. If you move the camera, ask the agent to look again and redraw.
+
+**Privacy:** the viewer is served on 127.0.0.1 only, so other devices on your network can't see it. It streams only while open.
+
+---
+
 ## Settings
 
 | Setting | Default | What it does |
 |---|---|---|
 | `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos are saved |
 | `cam` (tool input) | `0` | Which camera to use |
+| `BENCHSIGHT_PORT` (environment variable) | random free port | Port for the live viewer, if you want a fixed address |
 | `max_side` (tool input) | 1280 (`look`, `point`), 1600 (`watch`) | Longest side of the image sent to the agent. Smaller means faster and fewer tokens |
 
 To set `BENCHSIGHT_DIR` in Claude Code:
@@ -347,7 +390,10 @@ Project layout:
 
 ```
 src/benchsight/camera.py   camera access, zoom, contact sheet, point marker, local store
-src/benchsight/server.py   the MCP server and its four tools
+src/benchsight/server.py   the MCP server and its tools
+src/benchsight/feed.py     the live camera feed used by the viewer
+src/benchsight/overlay.py  annotation shapes, checks and drawing
+src/benchsight/viewer.py   the local live-viewer web page
 src/benchsight/cli.py      the benchsight CLI (snap, cameras)
 skills/hardware-help/      the Claude Code skill
 playbooks/                 checklists for specific builds
@@ -378,9 +424,10 @@ If that layer doesn't make the agent clearly more useful than a plain snapshot t
 ## Roadmap
 
 1. Real-world testing on SO-101 builds across Windows, macOS and Linux.
-2. A watch mode with a stop condition, for example "tell me when the servo stops jittering".
-3. A small eval set of real bench mistakes (wrong servo ID, reversed cable, missing screw, wrong calibration pose), run with and without benchsight.
-4. More playbooks: other arms, 3D printer setup, breadboards.
+2. Let you click or draw on the viewer to point at something for the agent.
+3. A watch mode with a stop condition, for example "tell me when the servo stops jittering".
+4. A small eval set of real bench mistakes (wrong servo ID, reversed cable, missing screw, wrong calibration pose), run with and without benchsight.
+5. More playbooks: other arms, 3D printer setup, breadboards.
 
 ## License
 
