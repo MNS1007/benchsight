@@ -89,6 +89,7 @@ def test_the_24_hour_backstop_only_touches_benchsight_files(tmp_path):
 
 
 def test_the_events_file_is_recorded(tmp_path, monkeypatch):
+    monkeypatch.setenv("BENCHSIGHT_TRACKER", "mil")  # never download a model in tests
     monkeypatch.setattr(camera, "STORE", tmp_path)
     t = server._make_tracker(None)
     t.events.add("still", 0.0)
@@ -152,7 +153,9 @@ def test_kept_with_benchsight_keep(tmp_path):
     assert path.exists()
 
 
-def test_deleted_when_the_mcp_client_closes_stdio(tmp_path):
+@pytest.mark.parametrize("end", ["stdio", "SIGTERM", "SIGINT"])
+def test_deleted_when_the_mcp_server_ends(tmp_path, end):
+    """The real server.main(): the client closes stdio, or kills it while mcp.run() waits."""
     script = textwrap.dedent("""
         import numpy as np
         from benchsight import camera, server
@@ -165,15 +168,18 @@ def test_deleted_when_the_mcp_client_closes_stdio(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "BENCHSIGHT_KEEP"}
     p = subprocess.Popen([sys.executable, "-c", script, str(note)], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**env, "BENCHSIGHT_DIR": str(store)})
-    end = time.time() + 20
-    while not note.exists() and time.time() < end:
+    end_at = time.time() + 20
+    while not (note.exists() and note.read_text()) and time.time() < end_at:
         time.sleep(0.05)
     path = note.read_text()
     assert os.path.exists(path)
-    p.stdin.close()
+    time.sleep(0.5)  # let mcp.run() start waiting on stdin
+    if end == "stdio":
+        p.stdin.close()
+    else:
+        p.send_signal(getattr(signal, end))
     p.wait(20)
     assert not os.path.exists(path)
-
 
 # ── benchsight clean ──
 
