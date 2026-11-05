@@ -33,6 +33,7 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 - [Develop](#develop)
 - [Why this exists](#why-this-exists)
 - [Roadmap](#roadmap)
+- [Credits](#credits)
 
 ---
 
@@ -373,7 +374,7 @@ Open the printed file. If it's black or the command fails, see [Troubleshooting]
    - "Look at the cable on servo 3 and tell me if it's fully seated."
    - "Watch the gripper while I run the calibration and tell me where it stops."
    - "Which pin does the yellow wire go to? Point at it."
-3. The agent calls `look`, `watch` or `point`. Claude Code asks your permission the first time it uses each tool.
+3. The agent calls `look`, `watch` or `point`, or opens the [live viewer](#the-live-viewer) and tracks the parts. Claude Code asks your permission the first time it uses each tool.
 4. Pair it with the terminal. If a script just failed, say so. The agent can read the error and check whether the hardware explains it: a wrong servo ID, an unplugged cable, the wrong port.
 
 Tips:
@@ -464,7 +465,7 @@ benchsight does not ship an object detector. **The agent is the labeller**: it a
 | MIL (offline fallback) | 4 | 13 | 33% | 100%, 13.6 fps |
 | MIL (offline fallback) | 8 | 10.5 | 45% | 100%, 6.8 fps |
 
-Before the budget and the cheaper settings, the same benchmark used two to four times as much: MIL filled a whole core from 4 parts up. Run `python scripts/bench_tracking.py --help` to measure your own machine; it uses a synthetic feed and needs no camera.
+Before the budget and the cheaper settings, the same benchmark used much more: 17% with nothing tracked, 75% for 8 VitTrack parts, and MIL filled a whole core from 4 parts up. Run `python scripts/bench_tracking.py --help` to measure your own machine; it uses a synthetic feed and needs no camera.
 
 **Credit:** the camera-motion estimate, the scene-graph memory and the event debouncer are adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex).
 
@@ -581,12 +582,15 @@ Run `benchsight clean --dry-run` to see what is there, then `benchsight clean` (
 ```bash
 # update
 pipx upgrade benchsight                 # pipx
+uv tool upgrade benchsight              # uv tool install
 git pull && pip install -e .            # from source
 
 # uninstall
-claude mcp remove benchsight
-pipx uninstall benchsight               # pipx
+benchsight clean --all --agent-cache    # saved photos, events and Claude Code's copies (run it in each project you used)
+claude mcp remove benchsight            # add --scope user if you added it that way
+pipx uninstall benchsight               # pipx (or: uv tool uninstall benchsight)
 rm -rf ~/.claude/skills/hardware-help   # the skill, if you copied it
+rm -rf ~/.cache/benchsight              # the downloaded VitTrack model
 ```
 
 ---
