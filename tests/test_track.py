@@ -381,6 +381,98 @@ def test_idle_tracker_measures_motion_at_2_hz_and_still_wakes_on_a_bump(tmp_path
     assert iou(get(t, "servo")["box"], sc.box(250, shift=(60, 30))) > 0.8
 
 
+# ── CPU budget ──
+
+class Counting(track.Backend):
+    """A real backend that counts tracker updates per object (keyed by init order)."""
+
+    def __init__(self, name, net=None):
+        super().__init__(name, net)
+        self.calls = []
+
+    def create(self):
+        inner, calls, i = super().create(), self.calls, len(self.calls)
+        calls.append(0)
+
+        class T:
+            def init(self, frame, rect):
+                return inner.init(frame, rect)
+
+            def update(self, frame):
+                calls[i] += 1
+                return inner.update(frame)
+
+            def getTrackingScore(self):
+                return inner.getTrackingScore()
+
+        return T()
+
+
+def four_parts(rng):
+    """Four textured squares over clutter: (scene, top-left corners, textures)."""
+    sc = Scene()
+    homes = [(80, 80), (360, 80), (80, 300), (360, 300)]
+    texs = [cv2.resize(rng.integers(0, 255, (6, 6, 3), dtype=np.uint8), (S, S), interpolation=cv2.INTER_NEAREST)
+            for _ in homes]
+    return sc, homes, texs
+
+
+def draw(sc, homes, texs, dx):
+    """The four squares, each shifted right by dx."""
+    f = sc.bg.copy()
+    for (x, y), tex in zip(homes, texs):
+        f[y:y + S, x + dx:x + dx + S] = tex
+    return f
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_over_budget_objects_take_turns_but_all_keep_up(backend):
+    sc, homes, texs = four_parts(np.random.default_rng(1))
+    b = Counting(backend, VIT if backend == "vit" else None)
+    t = track.Tracker(backend=b, budget=0.001)  # far below one update a frame
+    t.add([{"id": f"p{i}", "label": f"part {i}", "box": [x / W, y / H, (x + S) / W, (y + S) / H]}
+           for i, (x, y) in enumerate(homes)], frame=draw(sc, homes, texs, 0))
+    steps = 40
+    for k in range(1, steps + 1):
+        t.step(draw(sc, homes, texs, 2 * k), now=k / 15)
+    assert sum(b.calls) < 0.5 * 4 * steps, b.calls
+    assert sum(b.calls) >= 4 * steps / track.MAX_STRIDE, "each object still updates every MAX_STRIDE frames"
+    for i, (x, y) in enumerate(homes):
+        o = get(t, f"p{i}")
+        truth = [(x + 2 * steps) / W, y / H, (x + 2 * steps + S) / W, (y + S) / H]
+        assert o["status"] == "tracking" and iou(o["box"], truth) > 0.5, (i, o)
+
+
+def test_without_a_budget_every_object_updates_every_frame():
+    sc, homes, texs = four_parts(np.random.default_rng(1))
+    b = Counting("mil")
+    t = track.Tracker(backend=b)
+    t.add([{"label": f"part {i}", "box": [x / W, y / H, (x + S) / W, (y + S) / H]}
+           for i, (x, y) in enumerate(homes)], frame=draw(sc, homes, texs, 0))
+    for k in range(1, 6):
+        t.step(draw(sc, homes, texs, 0), now=k / 15)
+    assert sum(b.calls) == 4 * 5
+
+
+def test_a_new_object_updates_on_its_first_step_even_over_budget():
+    sc = Scene()
+    b = Counting("mil")
+    t = track.Tracker(backend=b, budget=1e-9)
+    t.add([{"label": "servo", "box": sc.box(200)}], frame=sc.frame(200))
+    t.step(sc.frame(200), now=0.0)
+    assert b.calls == [1]
+
+
+def test_the_server_tracker_has_the_cpu_budget(monkeypatch):
+    from benchsight import server
+    made = []
+    monkeypatch.setattr(server, "Tracker", lambda feed, **kw: made.append(kw))
+    server._make_tracker(None)
+    monkeypatch.setenv("BENCHSIGHT_CPU", "0")
+    server._make_tracker(None)
+    assert [m["budget"] for m in made] == [track.BUDGET, None]
+
+
 def test_cheaper_settings_mil_window_and_motion_size():
     """MIL searches a smaller window and camera motion runs at 320 px, to save CPU."""
     sc, t = Scene(), tracker("mil")

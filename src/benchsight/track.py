@@ -11,6 +11,10 @@ matched with ORB (falling back to template matching for plain parts) near its la
 then in the whole frame. When the whole frame shifts (the laptop is bumped), the camera's
 motion is applied to every box first and the trackers refine from there.
 
+The live tracker keeps to a CPU budget (BUDGET, a share of one core): when updating every
+object every frame would cost more, the objects updated longest ago go first and the rest
+wait (at most MAX_STRIDE - 1 frames), while camera motion still moves every box.
+
 Objects are remembered like in a scene graph: a new box whose label shares a word with an
 overlapping object's ("slider plate" over "white plate") merges into that object's id, shown
 boxes are smoothed, and lost objects keep their last box while their confidence decays.
@@ -56,6 +60,8 @@ REACQUIRE_EVERY = 5  # frames between searches for each lost object
 MIN_INLIERS = 10  # ORB matches agreeing on one placement to accept a re-found object
 MIN_MATCH = 0.65  # template-matching score to accept one
 MERGE_IOU = 0.3  # overlap needed to merge a box whose label only shares a word
+BUDGET = 0.15  # share of one core the live tracker aims for; objects beyond it update on later frames
+MAX_STRIDE = 4  # but every tracked object updates at least every 4th frame, whatever it costs
 MOTION_SIDE = 320  # camera motion is estimated at this size: 3x cheaper than 640, and enough
 MIL_WINDOW = 15.0  # MIL's search radius in px (OpenCV's default 25 costs 34 ms an update, this 19)
 IDLE_PERIOD = 0.5  # with nothing tracked, camera motion and events run at 2 Hz only
@@ -250,6 +256,8 @@ class TrackedObject:
     kp: tuple = ()  # ORB features of the template, for re-acquiring
     des: np.ndarray | None = None
     tries: int = 0  # steps since the object was lost
+    updated: int = -1  # step of the last tracker update, for round-robin under the budget
+    fresh: bool = True  # (re)started and not updated since: updates next step, budget or not
 
     def snapshot(self, w: int, h: int, backend: str) -> dict:
         return {"id": self.id, "label": self.label, "box": [round(v, 4) for v in _to_frac(self.box, w, h)],
@@ -292,9 +300,17 @@ class Tracker:
 
     def __init__(self, feed=None, backend: str | Backend = "auto", allow_download: bool = True,
                  max_objects: int = MAX_OBJECTS, max_side: int = motion.MAX_SIDE, fps: float = 15.0,
-                 cv_threads: int | None = 1, clock=time.time, events=None):
-        """events: an events.Events to write wake-ups to (lost, found, scene changes)."""
+                 cv_threads: int | None = 1, clock=time.time, events=None, budget: float | None = None):
+        """events: an events.Events to write wake-ups to (lost, found, scene changes).
+        budget: share of one core each step aims to stay under (at `fps` steps a second).
+        When updating every object would cost more, the objects seen longest ago update
+        first and the rest wait a frame or more (at most MAX_STRIDE - 1), while camera
+        motion still moves every box. None (the default here; the server uses BUDGET)
+        updates every object every frame."""
         self.feed, self.max_objects, self.max_side, self.fps = feed, max_objects, max_side, fps
+        self.budget = budget
+        self._cost: float | None = None  # running mean of one object update, CPU seconds
+        self._credit = 0.0  # CPU seconds the budget has left over, see step()
         self.events = events
         self.cv_threads, self.clock = cv_threads, clock
         self.backend = backend if isinstance(backend, Backend) else make_backend(backend, allow_download)
@@ -436,7 +452,7 @@ class Tracker:
         if template:
             obj.template = motion.gray(small)[y1:y2, x1:x2].copy()
             obj.kp, obj.des = motion.orb_features(obj.template, orb=motion.ORB_SMALL)
-        obj.tries = 0
+        obj.tries, obj.updated, obj.fresh = 0, self.steps - 1, True  # its box is exact now; update it next step
         obj.tracker = self.backend.create()
         obj.tracker.init(small, (x1, y1, x2 - x1, y2 - y1))
         obj.raw, obj.box = [x1, y1, x2, y2], [float(v) for v in (x1, y1, x2, y2)]
@@ -451,6 +467,9 @@ class Tracker:
         return jump <= 1.5 * max(ow, oh) and 0.4 <= area <= 2.5
 
     def _update(self, obj: TrackedObject, small: np.ndarray, g: np.ndarray, now: float) -> None:
+        # Smooth as if every waited frame had been seen: one update after k frames moves
+        # the shown box as far as k updates would have, so waiting objects don't lag.
+        alpha = 1 - (1 - ALPHA) ** max(1, min(MAX_STRIDE, self.steps - obj.updated))
         ok, rect = obj.tracker.update(small)
         x, y, bw, bh = rect
         new = [float(x), float(y), float(x + bw), float(y + bh)]
@@ -463,7 +482,7 @@ class Tracker:
             good = score >= VIT_MIN_SCORE
         if good:
             obj.raw, obj.score, obj.bad = new, float(score), 0
-            obj.box = _ema(obj.box, new)
+            obj.box = _ema(obj.box, new, alpha)
             obj.last_seen, obj.confidence = now, 1.0
             return
         # A tracker that slipped off (MIL drifts) but the object is still close by: snap
@@ -472,7 +491,7 @@ class Tracker:
         if near is not None and self._plausible(obj.raw, near):
             shown = obj.box
             self._init(obj, small, near, now, template=False)
-            obj.box = _ema(shown, near)
+            obj.box = _ema(shown, near, alpha)
             return
         obj.bad += 1
         if obj.bad >= LOST_AFTER:
@@ -518,6 +537,7 @@ class Tracker:
 
     def step(self, frame: np.ndarray, now: float | None = None) -> None:
         """Track every object on one frame (full size; it is downscaled here)."""
+        c0 = time.thread_time()  # CPU time of this thread, for the budget
         now = self.clock() if now is None else now
         small = self._small(frame)
         g = motion.gray(small)
@@ -536,10 +556,25 @@ class Tracker:
                 self.cam.reset()
                 self._skipped, self._idle_t = False, None
             self._compensate(small, g, now)
+            live = [o for o in self._objs.values() if o.status == "tracking" and o.tracker is not None]
+            if self.budget is not None:  # CPU credit: earned each step, spent by motion and updates
+                allow = self.budget / self.fps
+                spent = time.thread_time() - c0
+                self._credit = min(allow * MAX_STRIDE, max(-allow, self._credit + allow - spent))
+            for obj in sorted(live, key=lambda o: o.updated):  # longest waiting first
+                if (self.budget is not None and not obj.fresh and self.steps - obj.updated < MAX_STRIDE
+                        and self._credit < (self._cost or 0.0)):
+                    continue  # over budget: this one waits; camera motion has moved its box
+                s = time.thread_time()
+                self._update(obj, small, g, now)
+                cost = time.thread_time() - s
+                self._cost = cost if self._cost is None else 0.8 * self._cost + 0.2 * cost
+                if self.budget is not None:
+                    self._credit = max(-allow, self._credit - cost)
+                obj.updated, obj.fresh = self.steps, False
+            updating = {o.id for o in live}
             for obj in list(self._objs.values()):
-                if obj.status == "tracking" and obj.tracker is not None:
-                    self._update(obj, small, g, now)
-                else:
+                if obj.id not in updating:
                     self._reacquire(obj, small, g, now)
             self._decay(now)
             if self.events is not None:

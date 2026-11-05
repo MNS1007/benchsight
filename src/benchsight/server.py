@@ -20,7 +20,7 @@ from . import camera, cleanup
 from .events import Events
 from .feed import LiveFeed
 from .overlay import Overlay, render, resolve
-from .track import Tracker, check_box
+from .track import BUDGET, Tracker, check_box
 from .viewer import Viewer
 
 mcp = MCPServer("benchsight")
@@ -33,8 +33,10 @@ _look_boxes: dict[str, list[float]] = {}  # tracked boxes as they were in the la
 def _make_tracker(feed) -> Tracker:
     """The object tracker for the live feed. BENCHSIGHT_TRACKER picks the backend:
     auto (VitTrack, downloaded once, else MIL), vit or mil. Wake-up events go to
-    <store>/events.jsonl, for `benchsight events --follow`."""
-    return Tracker(feed, backend=os.environ.get("BENCHSIGHT_TRACKER", "auto"),
+    <store>/events.jsonl, for `benchsight events --follow`. BENCHSIGHT_CPU is the share
+    of one core tracking aims to stay under (default 0.15; 0 means no limit)."""
+    cpu = float(os.environ.get("BENCHSIGHT_CPU", BUDGET))
+    return Tracker(feed, backend=os.environ.get("BENCHSIGHT_TRACKER", "auto"), budget=cpu or None,
                    events=Events(camera.STORE / "events.jsonl", on_write=lambda p: cleanup.record(p, camera.STORE)))
 
 

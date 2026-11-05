@@ -1,7 +1,7 @@
 """Benchmark the tracker on a synthetic 640x480, 15 fps feed: fps reached and CPU use for
 0, 1, 4 and 8 objects, with MIL and (if its model is cached) VitTrack. No camera needed.
 
-  .venv/bin/python scripts/bench_tracking.py [--seconds 8] [--backends mil,vit]
+  .venv/bin/python scripts/bench_tracking.py [--seconds 8] [--backends mil,vit] [--cpu 0.15]
 
 CPU % is of one core: process CPU time (time.process_time, all threads) over wall time.
 "net" subtracts a run with the feed alone, which counts drawing the synthetic frames.
@@ -69,7 +69,7 @@ def measure(seconds: float, warmup: float, tick) -> tuple[float, float]:
     return 100 * (c1 - c0) / (w1 - w0), (s1 - s0) / (w1 - w0)
 
 
-def run(backend: str | None, n: int, seconds: float, store: Path) -> dict:
+def run(backend: str | None, n: int, seconds: float, store: Path, budget: float | None = track.BUDGET) -> dict:
     bench = Bench(n)
     feed = LiveFeed(fps=FPS, source=bench.frame)
     feed.start()
@@ -79,7 +79,7 @@ def run(backend: str | None, n: int, seconds: float, store: Path) -> dict:
             return {"cpu": cpu, "fps": fps, "tracking": 0}
         b = track.Backend("vit", track.model_path("vittrack", allow_download=False)) if backend == "vit" \
             else track.Backend("mil")
-        tracker = track.Tracker(feed, backend=b, fps=FPS, events=Events(store / "events.jsonl"))
+        tracker = track.Tracker(feed, backend=b, fps=FPS, events=Events(store / "events.jsonl"), budget=budget)
         if n:
             tracker.add(bench.boxes(), frame=feed.latest())
         tracker.start()
@@ -98,6 +98,8 @@ def main() -> None:
     p.add_argument("--seconds", type=float, default=8.0, help="measured seconds per run")
     p.add_argument("--backends", default="mil,vit")
     p.add_argument("--objects", default="0,1,4,8")
+    p.add_argument("--cpu", type=float, default=track.BUDGET,
+                   help="the tracker's CPU budget, share of one core (0: none); the server's default")
     a = p.parse_args()
     backends = [b for b in a.backends.split(",") if b]
     if "vit" in backends and not hasattr(cv2, "TrackerVit_create"):
@@ -107,14 +109,15 @@ def main() -> None:
         print("VitTrack model not cached; skipping vit (run the server once online to fetch it)")
         backends.remove("vit")
     print(f"{platform.platform()} | {platform.processor() or platform.machine()} | OpenCV {cv2.__version__}")
-    print(f"synthetic {W}x{H} feed at {FPS} fps, {a.seconds:.0f} s per run, tracker on 1 OpenCV thread\n")
+    print(f"synthetic {W}x{H} feed at {FPS} fps, {a.seconds:.0f} s per run, tracker on 1 OpenCV thread, "
+          f"budget {a.cpu or 'none'}\n")
     with tempfile.TemporaryDirectory() as tmp:
         base = run(None, 0, a.seconds, Path(tmp))
         print(f"feed alone: {base['cpu']:5.1f}% of one core, {base['fps']:4.1f} fps\n")
         print(f"{'backend':8} {'objects':>7} {'fps':>6} {'cpu %':>7} {'net %':>7} {'tracking':>9}")
         for backend in backends:
             for n in [int(x) for x in a.objects.split(",")]:
-                r = run(backend, n, a.seconds, Path(tmp))
+                r = run(backend, n, a.seconds, Path(tmp), a.cpu or None)
                 print(f"{backend:8} {n:7d} {r['fps']:6.1f} {r['cpu']:7.1f} {r['cpu'] - base['cpu']:7.1f} "
                       f"{r['tracking']:>4}/{n:<4}" + (f"  error: {r['error']}" if r.get("error") else ""))
 
