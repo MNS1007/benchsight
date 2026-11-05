@@ -173,3 +173,105 @@ def test_deleted_when_the_mcp_client_closes_stdio(tmp_path):
     p.stdin.close()
     p.wait(20)
     assert not os.path.exists(path)
+
+
+# ── benchsight clean ──
+
+def fill(store, n_old=2, n_new=2):
+    store.mkdir(parents=True, exist_ok=True)
+    old = [store / f"2020010{i}-000000-000-look.jpg" for i in range(1, n_old + 1)]
+    new = [store / f"2099010{i}-000000-000-watch.jpg" for i in range(1, n_new + 1)]
+    for p in old + new:
+        p.write_bytes(b"x" * 100)
+    for p in old:
+        os.utime(p, (OLD, OLD))
+    (store / "events.jsonl").write_text("{}\n")
+    return old, new
+
+
+def test_clean_deletes_only_benchsight_files_older_than_24_h(tmp_path, capsys):
+    from benchsight import cli
+    old, new = fill(tmp_path)
+    keep = decoys(tmp_path)
+    for p in keep:
+        os.utime(p, (OLD, OLD))
+    cli.main(["clean", "--dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert not any(p.exists() for p in old) and all(p.exists() for p in new + list(keep))
+    assert (tmp_path / "events.jsonl").exists()
+    assert "2 files deleted, 200 B freed" in out
+
+
+def test_clean_older_than_and_dry_run(tmp_path, capsys):
+    from benchsight import cli
+    old, new = fill(tmp_path)
+    cli.main(["clean", "--dir", str(tmp_path), "--older-than", "0", "--dry-run"])
+    out = capsys.readouterr().out
+    assert all(p.exists() for p in old + new) and "5 files" in out and "would delete" in out
+    cli.main(["clean", "--dir", str(tmp_path), "--older-than", "0"])
+    assert not any(p.exists() for p in old + new)
+
+
+def test_clean_all_spares_everything_not_benchsight(tmp_path, capsys):
+    from benchsight import cli
+    fill(tmp_path)
+    keep = decoys(tmp_path)
+    cli.main(["clean", "--dir", str(tmp_path), "--all"])
+    assert set(p for p in tmp_path.rglob("*") if p.is_file()) == keep
+    assert "5 files deleted" in capsys.readouterr().out
+    cli.main(["clean", "--dir", str(tmp_path / "missing"), "--all"])
+    assert "0 files deleted" in capsys.readouterr().out
+
+
+def fake_claude(home):
+    """A fake ~/.claude with benchsight blobs where Claude Code puts them, and decoys."""
+    proj = home / ".claude" / "projects" / "-Users-me-bench"
+    ours = [proj / "sess-1" / "tool-results" / "mcp-benchsight-blob-1-a.jpg",
+            proj / "tool-results" / "mcp-benchsight-blob-2-b.jpg"]
+    outside = home / "precious.jpg"
+    other = [proj / "sess-1" / "tool-results" / "mcp-other-blob-1.jpg",  # another server's
+             proj / "sess-1" / "tool-results" / "toolu_123.txt",
+             proj / "sess-1" / "mcp-benchsight-blob-3.jpg",  # not in tool-results
+             proj / "sess-1.jsonl",
+             home / ".claude" / "settings.json",
+             outside]
+    for p in ours + other:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"y" * 10)
+    link = proj / "sess-1" / "tool-results" / "mcp-benchsight-blob-link.jpg"
+    link.symlink_to(outside)
+    folder = proj / "sess-1" / "tool-results" / "mcp-benchsight-blob-dir"
+    folder.mkdir()
+    (folder / "inside.jpg").write_bytes(b"z")
+    return ours, other + [link, folder / "inside.jpg"]
+
+
+def test_clean_agent_cache_deletes_only_benchsight_blobs(tmp_path, monkeypatch, capsys):
+    from benchsight import cli
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    ours, others = fake_claude(home)
+    store = tmp_path / "store"
+    fill(store)
+    cli.main(["clean", "--dir", str(store), "--all", "--agent-cache", "--dry-run"])
+    out = capsys.readouterr().out
+    assert all(p.exists() for p in ours) and all(str(p) in out for p in ours)
+    assert not any(str(p) in out for p in others)
+    cli.main(["clean", "--dir", str(store), "--all", "--agent-cache"])
+    assert not any(p.exists() for p in ours)
+    assert all(p.exists() or p.is_symlink() for p in others)
+    assert "7 files deleted" in capsys.readouterr().out
+
+
+def test_agent_cache_respects_age_and_is_off_by_default(tmp_path, monkeypatch, capsys):
+    from benchsight import cli
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    ours, _ = fake_claude(home)
+    os.utime(ours[0], (OLD, OLD))
+    cli.main(["clean", "--dir", str(tmp_path / "store")])
+    assert all(p.exists() for p in ours)
+    cli.main(["clean", "--dir", str(tmp_path / "store"), "--agent-cache"])
+    assert not ours[0].exists() and ours[1].exists(), "a running session's young copies stay"
