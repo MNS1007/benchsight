@@ -467,6 +467,7 @@ def test_the_server_tracker_has_the_cpu_budget(monkeypatch):
     from benchsight import server
     made = []
     monkeypatch.setattr(server, "Tracker", lambda feed, **kw: made.append(kw))
+    monkeypatch.delenv("BENCHSIGHT_CPU", raising=False)
     server._make_tracker(None)
     monkeypatch.setenv("BENCHSIGHT_CPU", "0")
     server._make_tracker(None)
