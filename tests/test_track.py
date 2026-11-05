@@ -187,6 +187,30 @@ def test_duplicate_labels_near_each_other_merge():
     assert sorted(o["id"] for o in t.objects()) == ["servo", "slider-plate", "white-plate"]
 
 
+def test_objects_listed_in_one_call_stay_separate():
+    sc, t = Scene(), tracker("mil")
+    f = sc.frame(200)
+    pairs = [("left screw", [0.40, 0.40, 0.45, 0.45]), ("right screw", [0.47, 0.40, 0.52, 0.45]),
+             ("red wire", [0.10, 0.70, 0.16, 0.76]), ("black wire", [0.17, 0.70, 0.23, 0.76])]
+    got = t.add([{"label": lab, "box": b} for lab, b in pairs], frame=f)
+    assert [g["id"] for g in got] == ["left-screw", "right-screw", "red-wire", "black-wire"]
+    objs = {o["id"]: o for o in t.objects()}
+    assert len(objs) == 4
+    for g, (lab, b) in zip(got, pairs):
+        assert objs[g["id"]]["label"] == lab and iou(objs[g["id"]]["box"], b) > 0.8
+
+
+def test_a_new_part_beside_a_tracked_one_with_a_shared_word_is_not_merged():
+    sc, t = Scene(), tracker("mil")
+    f = sc.frame(200)
+    red = t.add([{"label": "red wire", "box": [0.10, 0.70, 0.16, 0.76]}], frame=f)
+    black = t.add([{"label": "black wire", "box": [0.17, 0.70, 0.23, 0.76]}], frame=f)
+    assert red[0]["id"] != black[0]["id"]
+    assert get(t, "red-wire")["label"] == "red wire"
+    again = t.add([{"label": "red wire", "box": [0.12, 0.71, 0.18, 0.77]}], frame=f)  # same label moved
+    assert again[0]["id"] == "red-wire" and len(t.objects()) == 2
+
+
 class Scripted(track.Backend):
     """A stand-in tracker that reports whatever box the test sets, to test the registry
     without a real tracker's noise."""

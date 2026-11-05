@@ -150,8 +150,8 @@ def track(objects: list[dict], replace: bool = True) -> dict:
     give its box as fractions 0-1 of that full photo:
       [{"id": "plate", "label": "slider plate", "box": [x1, y1, x2, y2]}, ...]
     id is optional (made from the label). A box whose label matches a tracked object
-    nearby (e.g. "slider plate" near "white plate") updates that object instead of
-    adding a duplicate. Up to 8 objects. replace=True (default) stops tracking objects
+    it overlaps (e.g. "slider plate" over "white plate") updates that object instead of
+    adding a duplicate; objects listed in one call always stay separate. Up to 8 objects. replace=True (default) stops tracking objects
     not in this list and removes shapes anchored to them; replace=False adds.
     Returns the ids: put them in annotate shapes as "anchor". Check positions cheaply
     with objects()."""

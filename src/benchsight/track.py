@@ -11,8 +11,8 @@ matched with ORB (falling back to template matching for plain parts) near its la
 then in the whole frame. When the whole frame shifts (the laptop is bumped), the camera's
 motion is applied to every box first and the trackers refine from there.
 
-Objects are remembered like in a scene graph: a new box whose label shares a word with a
-nearby object's ("slider plate" next to "white plate") merges into that object's id, shown
+Objects are remembered like in a scene graph: a new box whose label shares a word with an
+overlapping object's ("slider plate" over "white plate") merges into that object's id, shown
 boxes are smoothed, and lost objects keep their last box while their confidence decays.
 
 Registry ideas adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex)
@@ -54,6 +54,7 @@ PRUNE_BELOW = 0.2  # lost for ~53 s: forgotten
 REACQUIRE_EVERY = 5  # frames between searches for each lost object
 MIN_INLIERS = 10  # ORB matches agreeing on one placement to accept a re-found object
 MIN_MATCH = 0.65  # template-matching score to accept one
+MERGE_IOU = 0.3  # overlap needed to merge a box whose label only shares a word
 COMPENSATE = 0.3  # re-init a tracker when camera motion moved its box this share of its size
 STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "is", "with", "for"}
 
@@ -327,9 +328,9 @@ class Tracker:
             now = self.clock()
             h, w = ref.shape[:2]
             g = motion.gray(ref)
-            out, keep = [], set()
+            out, keep = [], set()  # keep: ids made or matched in this call
             for label, box, oid in items:
-                obj = self._match(oid, label, box, w, h)
+                obj = self._match(oid, label, box, w, h, skip=keep)
                 if obj is None:
                     self._make_room()
                     obj = TrackedObject(self._new_id(oid or label), label, [], [], g, first_seen=now)
@@ -370,16 +371,23 @@ class Tracker:
             oid, n = f"{base}-{n}", n + 1
         return oid
 
-    def _match(self, oid, label, box, w, h) -> TrackedObject | None:
+    def _match(self, oid, label, box, w, h, skip=()) -> TrackedObject | None:
         """The object a new box belongs to: the same id if given, else the nearest object
-        with a matching label (as VISTA's scene graph merges repeat sightings)."""
+        with a matching label (as VISTA's scene graph merges repeat sightings). Objects in
+        skip (made or matched earlier in the same call) are never merged into: one call
+        lists distinct objects, like a left and a right screw. A label that only shares a
+        word ('black wire' vs 'red wire') must also overlap the old box, so two parts side
+        by side stay two; the same label merges anywhere nearby."""
         if oid:
             return self._objs.get(oid)
         best, best_d = None, None
         for obj in self._objs.values():
-            if not labels_match(label, obj.label):
+            if obj.id in skip or not labels_match(label, obj.label):
                 continue
-            d = _near(box, _to_frac(obj.box, w, h))
+            old = _to_frac(obj.box, w, h)
+            if label.lower().strip() != obj.label.lower().strip() and _iou(box, old) < MERGE_IOU:
+                continue
+            d = _near(box, old)
             if d is not None and (best_d is None or d < best_d):
                 best, best_d = obj, d
         return best

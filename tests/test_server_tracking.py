@@ -98,6 +98,16 @@ def test_track_annotate_follow_and_untrack(live):
     assert server.objects() == [] and [s["label"] for s in server.overlay.state()["shapes"]] == ["static"]
 
 
+def test_two_alike_parts_in_one_call_get_their_own_ids_and_boxes(live):
+    server.open_viewer(open_browser=False)
+    server.look()
+    left, right = [0.40, 0.40, 0.45, 0.45], [0.47, 0.40, 0.52, 0.45]
+    got = server.track([{"label": "left screw", "box": left}, {"label": "right screw", "box": right}])
+    assert [o["id"] for o in got["tracking"]] == ["left-screw", "right-screw"]
+    assert server._look_boxes["left-screw"] == left and server._look_boxes["right-screw"] == right
+    assert sorted(o["id"] for o in server.objects()) == ["left-screw", "right-screw"]
+
+
 def test_replace_drops_old_objects_and_their_shapes(live):
     server.open_viewer(open_browser=False)
     server.look()
