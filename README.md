@@ -12,6 +12,7 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 
 ## Contents
 
+- [Set it up by pasting a prompt into your agent](#set-it-up-by-pasting-a-prompt-into-your-agent)
 - [What you get](#what-you-get)
 - [Requirements](#requirements)
 - [Install](#install)
@@ -32,6 +33,107 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 - [Develop](#develop)
 - [Why this exists](#why-this-exists)
 - [Roadmap](#roadmap)
+
+---
+
+## Set it up by pasting a prompt into your agent
+
+The quickest way to set up benchsight is to let your coding agent do it. Copy one of these prompts into the agent and it will install benchsight, connect it and check the camera, asking you before it changes anything on your system. The manual steps are below, from [Requirements](#requirements) on, if you'd rather do it by hand.
+
+### Claude Code
+
+```text
+Set up benchsight for me: an MCP server that lets you see my hardware workbench through
+my webcam. Source: https://github.com/MNS1007/benchsight. Do these steps in order, show me
+each command before you run it, and ask me before you install anything system-wide,
+change any system or privacy setting, or edit files outside this project.
+
+1. Check that Python 3.10 or newer is available (python3 --version, or python --version
+   on Windows). If not, stop and tell me how to install it.
+2. Run `claude mcp list`. If benchsight is already there, skip to step 5.
+3. Install it so `benchsight` and `benchsight-mcp` are on my PATH:
+   - if pipx is installed: pipx install git+https://github.com/MNS1007/benchsight
+   - else if uv is installed: uv tool install git+https://github.com/MNS1007/benchsight
+   - else ask me whether to install pipx first.
+   Then check with `benchsight --help`.
+4. Register the server for all my projects:
+   claude mcp add --scope user benchsight -- benchsight-mcp
+   If benchsight-mcp is not found from Claude Code, use its full path
+   (`which benchsight-mcp`, or `where benchsight-mcp` on Windows) instead.
+5. Install the hardware-help skill: shallow-clone the repo into a temporary folder
+   (git clone --depth 1 https://github.com/MNS1007/benchsight <temp folder>), copy its
+   skills/hardware-help folder into ~/.claude/skills/ (make the folder if needed), then
+   delete the temporary clone.
+6. Run `benchsight cameras`. It should print a list such as [0] or [0, 1].
+   If it prints [] or fails, the camera is probably blocked: do not change any setting
+   yourself. Tell me where to allow it: on macOS, System Settings > Privacy & Security >
+   Camera, for the terminal app I run Claude Code in (then I must restart that app); on
+   Windows, Settings > Privacy & security > Camera, with "Let desktop apps access your
+   camera" on; on Linux, my user must be in the `video` group. Also tell me to close
+   other apps that use the camera (Zoom, Teams, FaceTime, OBS).
+7. If this folder is a git repository, offer to add `.benchsight/` to its .gitignore.
+8. Finish with a short summary of what you did, and tell me to restart Claude Code so
+   the new tools load. After the restart, `/mcp` should list benchsight.
+```
+
+### Cursor, Claude Desktop and other MCP clients
+
+```text
+Set up benchsight for me: an MCP server that lets you see my hardware workbench through
+my webcam. Source: https://github.com/MNS1007/benchsight. Show me each command and each
+config change before you make it, and ask me before you install anything system-wide,
+change any system or privacy setting, or edit a config file.
+
+1. Check that Python 3.10 or newer is available. If not, stop and tell me how to get it.
+2. Install it so `benchsight` and `benchsight-mcp` are on my PATH: with pipx
+   (pipx install git+https://github.com/MNS1007/benchsight) or, if I have uv,
+   uv tool install git+https://github.com/MNS1007/benchsight. If I have neither, ask me
+   whether to install pipx. Check with `benchsight --help`.
+3. Find the full path of benchsight-mcp (`which benchsight-mcp` on macOS/Linux,
+   `where benchsight-mcp` on Windows). Apps started from the dock or Start menu often
+   don't see my shell's PATH, so use the full path in the config.
+4. Ask me which app I use, then add benchsight to its MCP config, keeping every server
+   that is already there (merge into "mcpServers"; don't overwrite the file):
+     {"mcpServers": {"benchsight": {"command": "<full path to benchsight-mcp>"}}}
+   - Cursor: ~/.cursor/mcp.json for all projects, or .cursor/mcp.json in this project.
+   - Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json on
+     macOS, %APPDATA%\Claude\claude_desktop_config.json on Windows (escape backslashes
+     in the path, like "C:\\Users\\me\\...\\benchsight-mcp.exe").
+   - Another client: find its documented MCP config file for local stdio servers and
+     tell me what you will add before you add it.
+5. Run `benchsight cameras`. It should print a list such as [0]. If it prints [] or
+   fails, don't change settings yourself: tell me where to allow camera access for this
+   app (macOS: System Settings > Privacy & Security > Camera; Windows: Settings > Privacy
+   & security > Camera, with desktop apps allowed; Linux: the `video` group), and to
+   close other apps using the camera. On macOS, camera permission is per app, so the
+   app itself (Cursor, Claude) must be allowed, not only the terminal.
+6. Optional, for Cursor: offer to save the guidance in
+   https://github.com/MNS1007/benchsight/blob/main/skills/hardware-help/SKILL.md as a
+   project rule, .cursor/rules/hardware-help.mdc.
+7. Finish with a summary, and tell me to fully quit and restart the app so it loads the
+   new server.
+```
+
+### First use
+
+Once it's set up and restarted, point the camera at your bench and paste this (change the job to yours):
+
+```text
+I'm assembling <my SO-101 arm's gripper>. Use the benchsight tools to guide me:
+1. Open the live viewer (open_viewer) and tell me where it opened.
+2. Take a wide look, then zoom on whatever matters. If the photo is too dark or blurry,
+   ask me to fix the light or the angle instead of guessing.
+3. Track the parts you will talk about (track), with short clear labels.
+4. Guide me one step at a time with annotate, anchoring each drawing to its part:
+   red for wrong, green for right, a yellow arrow for where to move something, and a
+   one-line caption. Check your drawings with look(with_annotations=True).
+5. While I work, if you're Claude Code, run `benchsight events --follow` with your
+   background Monitor tool, and look again when an event arrives instead of taking
+   photos in a loop. Use objects() for quick position checks.
+6. Check each step against the build docs and say which step you're on.
+7. When I say I'm done: stop the Monitor, call close_viewer so the camera turns off,
+   then call cleanup and tell me how much space it freed.
+```
 
 ---
 
