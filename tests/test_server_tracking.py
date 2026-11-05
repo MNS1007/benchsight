@@ -132,3 +132,5 @@ def test_viewer_opens_without_tracking_if_the_tracker_fails(live, monkeypatch):
     server.annotate([{"type": "text", "at": [0.5, 0.5], "text": "still works"}])
     with pytest.raises(ValueError, match="call track first"):
         server.annotate([{"type": "text", "at": [0.5, 0.5], "text": "x", "anchor": "plate"}])
+    with pytest.raises(ValueError, match="tracking is off: no tracker"):
+        server.track([{"label": "plate", "box": live.box()}])

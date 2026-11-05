@@ -24,7 +24,7 @@ from .viewer import Viewer
 mcp = MCPServer("benchsight")
 _last = None  # the last full frame taken, for point() and track()
 overlay = Overlay()
-_live: dict = {"feed": None, "viewer": None, "tracker": None}
+_live: dict = {"feed": None, "viewer": None, "tracker": None, "tracker_error": ""}
 _look_boxes: dict[str, list[float]] = {}  # tracked boxes as they were in the last look
 
 
@@ -36,6 +36,8 @@ def _make_tracker(feed) -> Tracker:
 
 def _tracker() -> Tracker:
     tracker = _live["tracker"]
+    if tracker is None and _live["viewer"] is not None:
+        raise ValueError(f"tracking is off: {_live['tracker_error']}")
     if tracker is None:
         raise ValueError("open the viewer first with open_viewer; tracking runs only while it is open")
     return tracker
@@ -127,6 +129,7 @@ def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
         note += f" Tracking ready ({tracker.backend.name})."
     except Exception as err:  # the viewer still works without tracking
         tracker, note = None, note + f" Tracking is off: {err}"
+        _live["tracker_error"] = str(err)
     port = int(os.environ.get("BENCHSIGHT_PORT", "0"))
     viewer = Viewer(feed, overlay, port=port, tracker=tracker)
     url = viewer.start()
@@ -228,7 +231,7 @@ def close_viewer() -> dict:
         viewer.stop()
     if feed is not None:
         feed.stop()
-    _live.update(feed=None, viewer=None, tracker=None)
+    _live.update(feed=None, viewer=None, tracker=None, tracker_error="")
     _look_boxes.clear()
     overlay.clear()
     return {"ok": True, "note": "Viewer closed, camera off."}

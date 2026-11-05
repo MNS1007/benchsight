@@ -77,7 +77,7 @@ function draw(state, fresh){
   }
   cap.textContent = state.caption || (state.shapes.length ? '' : 'Waiting for the agent.');
 }
-fetch('/overlay').then(r => r.json()).then(s => draw(s, true));
+fetch('/overlay').then(r => r.json()).then(s => { if (!cur || s.version > cur.version) draw(s, true); });  // events may arrive first
 const ev = new EventSource('/events');
 ev.onmessage = m => { const s = JSON.parse(m.data); draw(s, !cur || s.version !== cur.version); };
 ev.addEventListener('pos', m => {  // only the anchored shapes that moved
