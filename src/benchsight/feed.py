@@ -16,6 +16,7 @@ class LiveFeed:
         self._source = source
         self._cap = None
         self._frame: np.ndarray | None = None
+        self.seq = 0  # counts frames, so readers can skip one they already handled
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -52,6 +53,7 @@ class LiveFeed:
                 if frame is not None:
                     with self._lock:
                         self._frame = frame
+                        self.seq += 1
             except Exception as err:  # keep the viewer alive; report on the next tool call
                 self.error = str(err)
             time.sleep(max(0.0, period - (time.time() - t0)))
