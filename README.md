@@ -299,11 +299,11 @@ For step-by-step guidance, the agent can open a live view of your bench and draw
 {"type": "text",   "at": [0.6, 0.6], "text": "flip it over"}
 ```
 
-The drawings are fixed to the camera image. If you move the camera, ask the agent to look again and redraw.
+Drawings the agent anchors to a tracked object (with the `track` tool) follow that object as it or the camera moves. Other drawings are fixed to the camera image: if you move the camera, ask the agent to look again and redraw.
 
 **Privacy:** the viewer is served on 127.0.0.1 only, so other devices on your network can't see it. It streams only while open.
 
-**CPU use of tracking.** While the viewer is open, a tracker follows the objects the agent asked it to track (`track`), on the CPU. It aims to stay under 0.15 of one core (`BENCHSIGHT_CPU`). When updating every object every frame would cost more, the objects take turns: each one still updates at least every 4th frame, and camera motion moves all the boxes in between. That keeps one VitTrack object at the target. With more objects, or with the offline MIL fallback, it uses more, as the table shows, but much less than without the budget. Measured on an Apple M2 with OpenCV 5.0, a 640x480 feed at 15 fps, and one OpenCV thread (`python scripts/bench_tracking.py`):
+**CPU use of tracking.** While the viewer is open, a tracker follows the objects the agent asked it to track (`track`), on the CPU. It aims to stay under 0.15 of one core (`BENCHSIGHT_CPU`). When updating every object every frame would cost more, the objects take turns: each one still updates at least every 4th frame, and camera motion moves all the boxes in between. That keeps one VitTrack object at the target. With more objects, or with the offline MIL fallback, it uses more, as the table shows, but much less than without the budget. The cost of the budget: an object can wait up to 3 frames, so a hidden object is reported lost after up to about 0.8 s, and fast motion (over about 50 px/s at 640 px) is followed less closely, mostly with MIL. `BENCHSIGHT_CPU=0` updates every object every frame. Measured on an Apple M2 with OpenCV 5.0, a 640x480 feed at 15 fps, and one OpenCV thread (`python scripts/bench_tracking.py`):
 
 | Tracker | Objects | fps | CPU, share of one core | With no budget (`--cpu 0`) |
 |---|---|---|---|---|
