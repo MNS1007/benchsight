@@ -100,3 +100,62 @@ def test_live_feed_gives_the_latest_frame_and_stops():
     assert feed.running and feed.latest() is not None
     feed.stop()
     assert not feed.running and feed.latest() is None
+
+
+class StubTracker:
+    """Stands in for track.Tracker: the test moves the boxes by hand."""
+
+    def __init__(self, box):
+        self.objs = [{"id": "plate", "label": "plate", "box": box, "status": "tracking"}]
+
+    def objects(self):
+        return [dict(o) for o in self.objs]
+
+
+def sse(url, got, stop):
+    """Collect (event, data) pairs from /events until stop is set."""
+    with urllib.request.urlopen(url + "events", timeout=10) as r:
+        event = "message"
+        for line in r:
+            if line.startswith(b"event: "):
+                event = line[7:].strip().decode()
+            elif line.startswith(b"data: "):
+                got.append((event, json.loads(line[6:])))
+                event = "message"
+            if stop.is_set():
+                return
+
+
+def test_viewer_pushes_anchored_positions_only_when_they_change():
+    feed = LiveFeed(source=frame, fps=20)
+    feed.start()
+    ov, tr = Overlay(), StubTracker([0.2, 0.2, 0.4, 0.4])
+    ov.set([{"type": "box", "box": [0.2, 0.2, 0.4, 0.4], "anchor": "plate"},
+            {"type": "circle", "at": [0.8, 0.8], "r": 0.05}], anchors={"plate": [0.2, 0.2, 0.4, 0.4]})
+    v = Viewer(feed, ov, tracker=tr)
+    url = v.start()
+    got, stop = [], threading.Event()
+    t = threading.Thread(target=sse, args=(url, got, stop), daemon=True)
+    try:
+        assert json.loads(urllib.request.urlopen(url + "overlay", timeout=5).read())["shapes"][0]["lost"] is False
+        t.start()
+        time.sleep(0.4)
+        assert [e for e, _ in got] == ["message"], "one full state, then nothing while nothing moves"
+        tr.objs[0]["box"] = [0.5, 0.5, 0.7, 0.7]
+        time.sleep(0.4)
+        tr.objs[0]["status"] = "lost"
+        time.sleep(0.4)
+        tr.objs[0]["box"] = [0.50001, 0.5, 0.7, 0.7]  # sub-pixel jitter is not sent
+        time.sleep(0.4)
+        pos = [d for e, d in got if e == "pos"]
+        assert len(pos) == 2, got
+        assert list(pos[0]["shapes"]) == ["0"], "only the shape that moved"
+        assert pos[0]["shapes"]["0"]["box"] == [0.5, 0.5, 0.7, 0.7] and pos[0]["shapes"]["0"]["lost"] is False
+        assert pos[1]["shapes"]["0"]["lost"] is True
+        ov.set([{"type": "text", "at": [0.1, 0.1], "text": "next"}], replace=False)
+        time.sleep(0.3)
+        assert got[-1][0] == "message" and len(got[-1][1]["shapes"]) == 3
+    finally:
+        stop.set()
+        v.stop()
+        feed.stop()

@@ -210,11 +210,11 @@ def _round(v, nd):
     return v
 
 
-def resolve(state: dict, objects) -> dict:
+def resolve(state: dict, objects, digits: int = 4) -> dict:
     """The state with every anchored shape moved to its object's current box.
     objects: the tracker's objects() list (or {id: object}). A shape whose object is
     lost, stale or gone gets "lost": True (a gone one stays where it was drawn).
-    Unanchored shapes come back unchanged. Coordinates are rounded to 4 decimals."""
+    Unanchored shapes come back unchanged. Anchored coordinates are rounded to `digits` decimals."""
     if isinstance(objects, dict):
         objects = objects.values()
     by_id = {o["id"]: o for o in objects or ()}
@@ -226,7 +226,7 @@ def resolve(state: dict, objects) -> dict:
         o = by_id.get(s["anchor"])
         out = place(s, o["box"]) if o is not None else {**s}
         out.pop("rel", None)
-        out = {k: _round(v, 4) for k, v in out.items()}
+        out = {k: _round(v, digits) for k, v in out.items()}
         out["lost"] = o is None or o.get("status") != "tracking"
         shapes.append(out)
     return {**state, "shapes": shapes}
