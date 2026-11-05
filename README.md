@@ -6,7 +6,7 @@ When you're wiring up a robot arm or other hardware and get stuck, the usual loo
 
 benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with Claude Code, Claude Desktop, Cursor and any other MCP client.
 
-> Status: early (v0.0.1). The image tools are tested; real-camera testing on different machines is still ongoing. Issues and reports are welcome.
+> Status: early (v0.0.1). The image tools are tested; real-camera testing on different machines is still ongoing. Object tracking and wake-up events are tested on synthetic video only, and their thresholds are not yet tuned on a real bench camera. Issues and reports are welcome.
 
 ---
 
@@ -23,6 +23,8 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 - [Allow camera access](#allow-camera-access)
 - [Use it](#use-it)
 - [The live viewer](#the-live-viewer)
+- [How tracking works](#how-tracking-works)
+- [Disk space and cleanup](#disk-space-and-cleanup)
 - [Settings](#settings)
 - [Privacy](#privacy)
 - [Troubleshooting](#troubleshooting)
@@ -44,20 +46,30 @@ Tools the agent can call:
 | `watch` | Takes 2 to 9 photos over a few seconds and returns them as one numbered sheet, for something that moves (a servo sweep, a cable being seated) | `cam`, `seconds` (default 6), `frames` (default 6), `max_side` (default 1600) |
 | `point` | Circles a spot on the last `look` photo with a short label, to show you exactly which pin or cable it means. If the live viewer is open, the circle shows there too | `x`, `y` as fractions 0 to 1, `label` |
 | `open_viewer` | Opens the **live viewer**: a small local window with the camera feed, where the agent's drawings appear on top | `cam`, `open_browser` (default true) |
-| `annotate` | Draws on the live viewer: arrows, circles, boxes, freehand strokes and text, plus a one-line instruction under the video | `shapes` (list), `caption`, `replace` (default true) |
+| `track` | Follows parts on the live viewer. The agent names each part and boxes it on its latest `look`; benchsight then follows it frame by frame on the CPU | `objects`: a list of `{"id" (optional), "label", "box": [x1, y1, x2, y2]}`, up to 8; `replace` (default true: stop tracking parts not in the list) |
+| `objects` | Where the tracked parts are now, with no image: box, status (`tracking`, `lost` or `stale`) and seconds since last seen. A cheap check instead of a new photo | none |
+| `untrack` | Stops tracking parts, and removes the drawings anchored to them | `ids` (default: all) |
+| `annotate` | Draws on the live viewer: arrows, circles, boxes, freehand strokes and text, plus a one-line instruction under the video. A shape with `"anchor": "<id>"` follows that tracked part | `shapes` (list), `caption`, `replace` (default true) |
 | `clear_annotations` | Removes all drawings from the viewer | none |
-| `close_viewer` | Closes the viewer and turns the camera off | none |
+| `close_viewer` | Closes the viewer, stops tracking and turns the camera off | none |
+| `cleanup` | Deletes the photos and events file this session has saved so far, and says how much space it freed. They are deleted anyway when the session ends | none |
 
 `look` also takes `with_annotations` (default false). With it, the agent gets the photo with its own drawings on it, so it can check they landed in the right place.
 
 You also get:
 
-- **`benchsight` CLI:** `benchsight cameras` lists cameras, and `benchsight snap` saves one photo and prints its path. Use it with agents that don't support MCP: ask the agent to run `benchsight snap` and then open the image.
+- **`benchsight` CLI:**
+  - `benchsight cameras` lists cameras.
+  - `benchsight snap [--cam N] [--max-side PX]` saves one photo and prints its path. Use it with agents that don't support MCP: ask the agent to run `benchsight snap` and then open the image.
+  - `benchsight events [-f/--follow] [-n LINES] [--dir DIR]` prints the tracker's recent events (a part lost or found, the scene changed, the bench went still). With `--follow` it keeps printing new ones, one JSON line each, so an agent can wake on them (see [The live viewer](#the-live-viewer)).
+  - `benchsight clean [--all] [--older-than HOURS] [--dry-run] [--agent-cache] [--dir DIR]` deletes saved benchsight files (see [Disk space and cleanup](#disk-space-and-cleanup)).
 - **The `hardware-help` skill for Claude Code:** it tells the agent how to use the camera well. It asks you to point the camera first, then works through these steps:
   1. take a wide shot, then zoom;
   2. check what it sees against the build docs;
-  3. circle the exact part;
-  4. say when a photo can't settle the question.
+  3. circle the exact part, or, on the live viewer, track the parts and draw on them;
+  4. optionally wake on tracker events while you work, instead of taking photos in a loop;
+  5. say when a photo can't settle the question;
+  6. close the viewer and clean up at the end.
 - **Playbooks:** short checklists for common builds. The first one is the LeRobot SO-101 arm.
 
 ---
@@ -299,11 +311,46 @@ For step-by-step guidance, the agent can open a live view of your bench and draw
 {"type": "text",   "at": [0.6, 0.6], "text": "flip it over"}
 ```
 
-Drawings the agent anchors to a tracked object (with the `track` tool) follow that object as it or the camera moves. Other drawings are fixed to the camera image: if you move the camera, ask the agent to look again and redraw.
+**Drawings that follow the part.** Ask the agent to track the parts it is talking about ("track the gripper and the bracket"). It calls `look`, decides what each part is and where, and calls `track` with a box for each. Then it adds `"anchor": "<id>"` to a shape, and the shape sticks to that part as the part or the camera moves:
+
+```json
+{"type": "box",    "box": [0.59, 0.41, 0.82, 0.63], "label": "wrong bracket", "anchor": "bracket"}
+{"type": "arrow",  "from": [0.7, 0.2], "to": [0.62, 0.45], "label": "this screw first", "anchor": "bracket"}
+```
+
+- Boxes and circles follow the part and grow or shrink with it. An arrow's head follows the part and its tail keeps its offset. Paths and text move with the part's centre.
+- When the part is hidden or leaves the frame, its drawings stay at its last place, **dashed and faded, with a "(lost)" tag**. When the part comes back, benchsight finds it again and the drawings snap back to it.
+- Drawings without an anchor are fixed to the camera image: if you move the camera, ask the agent to look again and redraw.
+- `untrack`, or a new `track` call that leaves a part out, also removes the drawings anchored to it.
+
+**Let the agent wake when something changes (Claude Code).** Instead of taking photos in a loop, the agent can run `benchsight events --follow` with Claude Code's background **Monitor** tool. The command prints one JSON line when something happens on the bench, and each line wakes the agent, which then takes a look and redraws. Ask for it in plain words: "Guide me through mounting the gripper, and watch the bench while I work."
+
+Each line looks like this:
+
+```json
+{"t": 1793920489.81, "time": "2026-11-05T15:14:49", "event": "object_lost", "events": [{"event": "object_lost", "id": "gripper", "label": "gripper"}], "summary": "gripper (gripper) lost"}
+```
+
+- Events: `object_lost`, `object_found`, `scene_changed` (the camera was bumped, something big moved, or the view was blocked) and `still` (the bench went calm after a burst of motion).
+- Lines are debounced to about one every 5 seconds; everything in between is merged into the next line, so the agent isn't woken more often than that.
+- Events are written only while the viewer is open, to `events.jsonl` in the photo folder. `benchsight events --follow` reads `./.benchsight` by default. If you set `BENCHSIGHT_DIR` for the server, the agent's shell does not see it: pass the same folder with `--dir`.
+- A Monitor runs for 30 minutes at most. The agent re-arms it if the job takes longer. You can also watch the events yourself in a second terminal with the same command.
 
 **Privacy:** the viewer is served on 127.0.0.1 only, so other devices on your network can't see it. It streams only while open.
 
-**CPU use of tracking.** While the viewer is open, a tracker follows the objects the agent asked it to track (`track`), on the CPU. It aims to stay under 0.15 of one core (`BENCHSIGHT_CPU`). When updating every object every frame would cost more, the objects take turns: each one still updates at least every 4th frame, and camera motion moves all the boxes in between. That keeps one VitTrack object at the target. With more objects, or with the offline MIL fallback, it uses more, as the table shows, but much less than without the budget. The cost of the budget: an object can wait up to 3 frames, so a hidden object is reported lost after up to about 0.8 s, and fast motion (over about 50 px/s at 640 px) is followed less closely, mostly with MIL. `BENCHSIGHT_CPU=0` updates every object every frame. Measured on an Apple M2 with OpenCV 5.0, a 640x480 feed at 15 fps, and one OpenCV thread (`python scripts/bench_tracking.py`):
+---
+
+## How tracking works
+
+benchsight does not ship an object detector. **The agent is the labeller**: it already understands the photo, so it names each part and gives a rough box. benchsight's job is only to keep that box on the part afterwards, cheaply and on the CPU, while the viewer is open.
+
+- **Trackers.** Each part gets its own OpenCV tracker. The default is **VitTrack**, a small model (one ONNX file under 1 MB) downloaded once from [opencv_zoo](https://github.com/opencv/opencv_zoo) into `~/.cache/benchsight/models` and checked against a pinned SHA-256. If the download fails or you are offline, benchsight falls back to OpenCV's **MIL** tracker, which needs no file. `track` returns the `backend` in use. No GPU, torch or onnxruntime is needed.
+- **Camera motion.** If the laptop gets bumped, every part seems to move at once. benchsight estimates the whole frame's shift (sparse optical flow every frame, ORB feature matching every few frames) and moves all boxes by it before each tracker refines its own.
+- **Lost and found.** A part is marked lost after 3 bad frames in a row: low tracker score, or a jump or size change that can't be real. It keeps its last box. Every few frames benchsight looks for it again, first near its last place and then in the whole frame, by matching features and then the picture of the part the agent first boxed. When found, its tracker restarts.
+- **Memory.** Parts are remembered like a small scene graph. A new box with a matching label over an existing part (say "slider plate" over "white plate") updates that part instead of adding a duplicate. Shown boxes are smoothed so drawings don't jitter. A lost part fades: it is `stale` after about 30 seconds and forgotten after about 50.
+- **Events.** The same camera-motion estimate, plus how much of a small thumbnail changed, drives the `scene_changed` and `still` events.
+
+**CPU use.** While the viewer is open, the tracker follows the objects the agent asked it to track (`track`), on the CPU. It aims to stay under 0.15 of one core (`BENCHSIGHT_CPU`). When updating every object every frame would cost more, the objects take turns: each one still updates at least every 4th frame, and camera motion moves all the boxes in between. That keeps one VitTrack object at the target. With more objects, or with the offline MIL fallback, it uses more, as the table shows, but much less than without the budget. The cost of the budget: an object can wait up to 3 frames, so a hidden object is reported lost after up to about 0.8 s, and fast motion (over about 50 px/s at 640 px) is followed less closely, mostly with MIL. `BENCHSIGHT_CPU=0` updates every object every frame. Measured on an Apple M2 with OpenCV 5.0, a 640x480 feed at 15 fps, and one OpenCV thread (`python scripts/bench_tracking.py`):
 
 | Tracker | Objects | fps | CPU, share of one core | With no budget (`--cpu 0`) |
 |---|---|---|---|---|
@@ -315,7 +362,35 @@ Drawings the agent anchors to a tracked object (with the `track` tool) follow th
 | MIL (offline fallback) | 4 | 13 | 33% | 100%, 13.6 fps |
 | MIL (offline fallback) | 8 | 10.5 | 45% | 100%, 6.8 fps |
 
-VitTrack is used when its model file (under 1 MB) has been downloaded once into `~/.cache/benchsight/models`; offline, benchsight falls back to MIL.
+Before the budget and the cheaper settings, the same benchmark used two to four times as much: MIL filled a whole core from 4 parts up. Run `python scripts/bench_tracking.py --help` to measure your own machine; it uses a synthetic feed and needs no camera.
+
+**Credit:** the camera-motion estimate, the scene-graph memory and the event debouncer are adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex).
+
+---
+
+## Disk space and cleanup
+
+benchsight saves every photo, zoom, contact sheet and annotated image it sends to the agent, in the photo folder (`.benchsight/` in the folder the server starts in, or `BENCHSIGHT_DIR`). So it doesn't fill your disk:
+
+- **When the session ends, its files are deleted.** That is when your agent closes the server, or the server exits or gets SIGTERM, SIGINT or SIGHUP. Only files this session wrote are deleted, plus the events file. Set `BENCHSIGHT_KEEP=1` to keep them.
+- **24-hour backstop.** Each new photo also deletes benchsight photos older than 24 hours, in case a session was killed hard (for example with `kill -9`).
+- **During a session**, the agent can call the `cleanup` tool to delete what the session has saved so far.
+- **By hand**, use `benchsight clean`. Try `--dry-run` first: it only lists what would go.
+
+```bash
+benchsight clean --dry-run          # list benchsight files older than 24 h
+benchsight clean                    # delete them
+benchsight clean --older-than 2     # older than 2 hours
+benchsight clean --all              # every benchsight file, whatever its age
+benchsight clean --dir /path/to/photos
+benchsight clean --agent-cache --dry-run   # also Claude Code's own copies (see below)
+```
+
+- **Claude Code keeps its own copies.** When a tool returns an image, Claude Code saves a copy under `~/.claude/projects/<project>/<session>/tool-results/` named `mcp-benchsight-blob-*`. benchsight's session cleanup does not touch these. `benchsight clean --agent-cache` deletes them, with the same 24-hour rule unless you add `--all`, so a running session's recent images stay. It also looks in `CLAUDE_CONFIG_DIR` if you set it.
+
+What benchsight will delete is deliberately narrow, because `BENCHSIGHT_DIR` can point anywhere: only regular files directly in the photo folder, named the way benchsight names them (like `20261105-151449-812-look.jpg`), and `events.jsonl`. With `--agent-cache`, only files named `mcp-benchsight-blob-*` in a `tool-results` folder. It never deletes folders, symlinks, or other files, even ones next to its own.
+
+One caveat: `events.jsonl` is shared by every session that uses the same photo folder. Ending one session deletes it even if another session is still writing to it. Only past lines are lost; new events keep coming.
 
 ---
 
@@ -323,26 +398,33 @@ VitTrack is used when its model file (under 1 MB) has been downloaded once into 
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos are saved |
+| `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos and `events.jsonl` are saved |
+| `BENCHSIGHT_KEEP` (environment variable) | unset | Set to `1` to keep this session's files when it ends. The 24-hour backstop still applies |
+| `BENCHSIGHT_MODELS` (environment variable) | `~/.cache/benchsight/models` | Where the VitTrack model file is downloaded and kept |
 | `cam` (tool input) | `0` | Which camera to use |
 | `BENCHSIGHT_PORT` (environment variable) | random free port | Port for the live viewer, if you want a fixed address |
 | `BENCHSIGHT_TRACKER` (environment variable) | `auto` | Object tracker: `auto` (VitTrack if its model is available, else MIL), `vit` or `mil` |
 | `BENCHSIGHT_CPU` (environment variable) | `0.15` | Share of one core tracking aims to stay under. `0` means no limit: every object updates every frame |
 | `max_side` (tool input) | 1280 (`look`, `point`), 1600 (`watch`) | Longest side of the image sent to the agent. Smaller means faster and fewer tokens |
 
-To set `BENCHSIGHT_DIR` in Claude Code:
+To set one in Claude Code, add `-e NAME=value` (repeat it for more):
 
 ```bash
-claude mcp add benchsight -e BENCHSIGHT_DIR=/path/to/photos -- benchsight-mcp
+claude mcp add benchsight -e BENCHSIGHT_DIR=/path/to/photos -e BENCHSIGHT_TRACKER=mil -- benchsight-mcp
 ```
+
+In Claude Desktop, Cursor and other clients, add an `"env": {"BENCHSIGHT_DIR": "/path/to/photos"}` entry next to `"command"`.
 
 ---
 
 ## Privacy
 
-- **No background recording.** A photo is taken only when the agent calls a tool, and your client asks you before the first call.
-- **Photos stay on your machine.** They're saved in the photo folder (see [Settings](#settings)) and deleted after 24 hours.
-- **The only thing sent anywhere** is the photo the agent asked for, to the model you already use.
+- **No hidden photos.** A photo is taken only when the agent calls a tool, and your client asks you before the first call. The camera stays on between photos only while the live viewer is open, until `close_viewer`.
+- **No recording, also with the viewer open.** The live viewer and the tracker keep frames in memory only. They save nothing to disk except the small `events.jsonl` (event names and part labels, no images).
+- **Photos stay on your machine.** They're saved in the photo folder (see [Settings](#settings)) and deleted when the session ends, or after 24 hours at the latest. See [Disk space and cleanup](#disk-space-and-cleanup).
+- **Your agent may keep its own copies.** Claude Code saves each image a tool returns in its session folder under `~/.claude/projects/`. Delete those with `benchsight clean --agent-cache`.
+- **Tracking runs locally.** The trackers run on your CPU. The only download is the VitTrack model file, once, from GitHub; no images are sent for it.
+- **The only thing sent anywhere** is the photo the agent asked for, to the model you already use. Tracking sends nothing.
 - Many webcams turn on a light while the camera is in use, so you can see when a photo is taken.
 
 Add `.benchsight/` to your project's `.gitignore` so photos are never committed.
@@ -372,6 +454,24 @@ Run `claude mcp list`. If benchsight shows as failed, run the same command it us
 **macOS: it worked in Terminal but not in Claude Desktop or Cursor**
 Camera permission is per app. Turn it on for that app too.
 
+**`open_viewer` says "Tracking is off: ..."**
+The viewer still works; only `track` and anchored drawings don't. The message says why. If it's about the tracker, try `BENCHSIGHT_TRACKER=mil`.
+
+**Tracking uses MIL, not VitTrack (the `backend` in `track`'s result)**
+The model download failed, usually because you were offline. benchsight tries again the next time the viewer opens. To download it ahead of time, open the viewer once while online. To work offline on purpose, set `BENCHSIGHT_TRACKER=mil`. MIL works but is slower and less steady; see [How tracking works](#how-tracking-works).
+
+**A part shows "(lost)" and doesn't come back**
+benchsight looks for lost parts again by themselves, but a part that turned a lot, changed shape (a gripper opening) or is now under bad light may not match the picture first boxed. Ask the agent to look again and track it again; a new box with the same label updates the same part, so its drawings stay.
+
+**Drawings lag behind fast movement**
+To save CPU, parts take turns updating. Set `BENCHSIGHT_CPU=0` to update every part every frame, if your machine has CPU to spare.
+
+**`benchsight events --follow` prints nothing**
+Events are written only while the viewer is open, and only when something happens. Check that it reads the right folder: it uses `./.benchsight` unless you pass `--dir` (the server's `BENCHSIGHT_DIR` is not seen by other shells). `benchsight events` without `--follow` prints the last 20 lines.
+
+**The photo folder is getting big**
+Run `benchsight clean --dry-run` to see what is there, then `benchsight clean` (or `--all`). See [Disk space and cleanup](#disk-space-and-cleanup).
+
 ---
 
 ## Update and uninstall
@@ -400,7 +500,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-The tests use synthetic images and need no camera.
+The tests use synthetic images and video and need no camera and no network. Tests that need the VitTrack model run only if it is already downloaded; the MIL fallback is always tested.
 
 Project layout:
 
@@ -408,12 +508,17 @@ Project layout:
 src/benchsight/camera.py   camera access, zoom, contact sheet, point marker, local store
 src/benchsight/server.py   the MCP server and its tools
 src/benchsight/feed.py     the live camera feed used by the viewer
-src/benchsight/overlay.py  annotation shapes, checks and drawing
+src/benchsight/overlay.py  annotation shapes, anchors, checks and drawing
 src/benchsight/viewer.py   the local live-viewer web page
-src/benchsight/cli.py      the benchsight CLI (snap, cameras)
+src/benchsight/track.py    object tracking: VitTrack/MIL, lost and found, scene memory, CPU budget
+src/benchsight/motion.py   camera motion from optical flow and ORB
+src/benchsight/events.py   wake-up events and their debouncer, events --follow
+src/benchsight/cleanup.py  deleting saved files at session end and on demand
+src/benchsight/cli.py      the benchsight CLI (snap, cameras, events, clean)
+scripts/bench_tracking.py  CPU and fps benchmark for tracking (no camera)
 skills/hardware-help/      the Claude Code skill
 playbooks/                 checklists for specific builds
-tests/                     tests (no camera needed)
+tests/                     tests (no camera, no network needed)
 ```
 
 To try the server by hand, use the MCP Inspector:
@@ -439,11 +544,26 @@ If that layer doesn't make the agent clearly more useful than a plain snapshot t
 
 ## Roadmap
 
-1. Real-world testing on SO-101 builds across Windows, macOS and Linux.
+Done:
+
+- Live viewer with drawings that follow tracked parts, on the CPU.
+- Wake-up events (`benchsight events --follow`), so the agent can react to the bench instead of polling it.
+- Session-end cleanup of saved images, and `benchsight clean`.
+
+Next:
+
+1. Real-world testing on SO-101 builds across Windows, macOS and Linux, and tuning the event thresholds on real bench cameras.
 2. Let you click or draw on the viewer to point at something for the agent.
 3. A watch mode with a stop condition, for example "tell me when the servo stops jittering".
 4. A small eval set of real bench mistakes (wrong servo ID, reversed cable, missing screw, wrong calibration pose), run with and without benchsight.
 5. More playbooks: other arms, 3D printer setup, breadboards.
+6. State-change events, such as "screw now present", after the agent re-labels a part.
+7. An optional on-device open-vocabulary detector (for example YOLO-World or YOLOE as ONNX), as an extra (`pip install benchsight[detect]`), only to re-label parts. The agent stays the main labeller, and the base install stays light.
+8. Coordinates that don't depend on the camera's pose (VISTA's allocentric heading and polar coordinates), for a moving camera such as one on the robot's wrist. A fixed bench camera doesn't need them.
+
+## Credits
+
+Camera-motion estimation, the scene-graph object memory and the event debouncer are adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex). Object tracking uses OpenCV's VitTrack model from [opencv_zoo](https://github.com/opencv/opencv_zoo) and its MIL tracker.
 
 ## License
 
