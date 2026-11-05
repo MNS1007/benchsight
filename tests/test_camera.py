@@ -41,4 +41,4 @@ def test_server_registers_the_tools():
     from benchsight import server
     tools = asyncio.run(server.mcp.list_tools())
     assert {t.name for t in tools} == {"cameras", "look", "watch", "point", "open_viewer", "track", "objects", "untrack",
-                                       "annotate", "clear_annotations", "close_viewer"}
+                                       "annotate", "clear_annotations", "close_viewer", "cleanup"}

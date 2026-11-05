@@ -5,7 +5,8 @@ window with the camera feed, where the agent draws arrows, circles, boxes, freeh
 strokes and text to guide the builder. It runs only while open and serves 127.0.0.1 only.
 While it is open, objects the agent boxes with track() are followed frame by frame on the
 CPU, and shapes anchored to them move with them.
-Images are kept in ./.benchsight (or BENCHSIGHT_DIR) for 24 hours.
+Images are saved in ./.benchsight (or BENCHSIGHT_DIR) and deleted when the session ends
+(BENCHSIGHT_KEEP=1 keeps them), or after 24 hours at the latest.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import webbrowser
 
 from mcp.server.mcpserver import Image, MCPServer
 
-from . import camera
+from . import camera, cleanup
 from .events import Events
 from .feed import LiveFeed
 from .overlay import Overlay, render, resolve
@@ -34,7 +35,7 @@ def _make_tracker(feed) -> Tracker:
     auto (VitTrack, downloaded once, else MIL), vit or mil. Wake-up events go to
     <store>/events.jsonl, for `benchsight events --follow`."""
     return Tracker(feed, backend=os.environ.get("BENCHSIGHT_TRACKER", "auto"),
-                   events=Events(camera.STORE / "events.jsonl"))
+                   events=Events(camera.STORE / "events.jsonl", on_write=lambda p: cleanup.record(p, camera.STORE)))
 
 
 def _tracker() -> Tracker:
@@ -240,8 +241,21 @@ def close_viewer() -> dict:
     return {"ok": True, "note": "Viewer closed, camera off."}
 
 
+@mcp.tool(name="cleanup")
+def cleanup_files() -> dict:
+    """Delete the photos, annotated images, contact sheets and events file this session
+    has saved so far (they are deleted anyway when the session ends). Returns how many
+    files and bytes were freed."""
+    n, freed = cleanup.session_end()
+    return {"ok": True, "files": n, "bytes": freed, "freed": cleanup.human(freed)}
+
+
 def main() -> None:
-    mcp.run()
+    cleanup.install()  # delete this session's files on exit and on SIGTERM/SIGINT/SIGHUP
+    try:
+        mcp.run()  # returns when the client closes stdio
+    finally:
+        cleanup.session_end()
 
 
 if __name__ == "__main__":

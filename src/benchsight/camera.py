@@ -10,8 +10,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import cleanup
+
 STORE = Path(os.environ.get("BENCHSIGHT_DIR", ".benchsight"))  # where photos are kept
 KEEP_SECONDS = 24 * 3600  # saved frames older than this are deleted on the next capture
+# (a backstop: each session deletes its own files when it ends, see cleanup.py)
 
 
 @dataclass
@@ -98,16 +101,16 @@ def mark(img: np.ndarray, x: float, y: float, text: str = "") -> np.ndarray:
 
 
 def save(img: np.ndarray, name: str, quality: int = 85, store: Path = STORE) -> Shot:
-    """Write a JPEG to the local store (kept 24 hours) and return its bytes."""
+    """Write a JPEG to the local store and return its bytes. It is deleted when this
+    session ends (unless BENCHSIGHT_KEEP=1), or after 24 hours at the latest."""
     store.mkdir(parents=True, exist_ok=True)
     now = time.time()
-    for old in store.glob("*.jpg"):
-        if now - old.stat().st_mtime > KEEP_SECONDS:
-            old.unlink(missing_ok=True)
+    cleanup.delete(cleanup.store_files(store, KEEP_SECONDS, now))
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise RuntimeError("could not encode the image")
     path = store / f"{time.strftime('%Y%m%d-%H%M%S')}-{int(now * 1000) % 1000:03d}-{name}.jpg"
     path.write_bytes(buf.tobytes())
+    cleanup.record(path, store)
     h, w = img.shape[:2]
     return Shot(path, buf.tobytes(), w, h)
