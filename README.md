@@ -303,6 +303,20 @@ The drawings are fixed to the camera image. If you move the camera, ask the agen
 
 **Privacy:** the viewer is served on 127.0.0.1 only, so other devices on your network can't see it. It streams only while open.
 
+**CPU use of tracking.** While the viewer is open, a tracker follows the objects the agent asked it to track (`track`), on the CPU. It aims to stay under 0.15 of one core (`BENCHSIGHT_CPU`). When updating every object every frame would cost more, the objects take turns: each one still updates at least every 4th frame, and camera motion moves all the boxes in between. That keeps one VitTrack object at the target. With more objects, or with the offline MIL fallback, it uses more, as the table shows, but much less than without the budget. Measured on an Apple M2 with OpenCV 5.0, a 640x480 feed at 15 fps, and one OpenCV thread (`python scripts/bench_tracking.py`):
+
+| Tracker | Objects | fps | CPU, share of one core | With no budget (`--cpu 0`) |
+|---|---|---|---|---|
+| none tracked | 0 | 14 | 3% | 3% |
+| VitTrack | 1 | 14 | 15% | 24% |
+| VitTrack | 4 | 14 | 22% | 37% |
+| VitTrack | 8 | 14 | 28% | 70% |
+| MIL (offline fallback) | 1 | 13 | 18% | 32% |
+| MIL (offline fallback) | 4 | 13 | 33% | 100%, 13.6 fps |
+| MIL (offline fallback) | 8 | 10.5 | 45% | 100%, 6.8 fps |
+
+VitTrack is used when its model file (under 1 MB) has been downloaded once into `~/.cache/benchsight/models`; offline, benchsight falls back to MIL.
+
 ---
 
 ## Settings
@@ -312,6 +326,8 @@ The drawings are fixed to the camera image. If you move the camera, ask the agen
 | `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos are saved |
 | `cam` (tool input) | `0` | Which camera to use |
 | `BENCHSIGHT_PORT` (environment variable) | random free port | Port for the live viewer, if you want a fixed address |
+| `BENCHSIGHT_TRACKER` (environment variable) | `auto` | Object tracker: `auto` (VitTrack if its model is available, else MIL), `vit` or `mil` |
+| `BENCHSIGHT_CPU` (environment variable) | `0.15` | Share of one core tracking aims to stay under. `0` means no limit: every object updates every frame |
 | `max_side` (tool input) | 1280 (`look`, `point`), 1600 (`watch`) | Longest side of the image sent to the agent. Smaller means faster and fewer tokens |
 
 To set `BENCHSIGHT_DIR` in Claude Code:
