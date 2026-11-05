@@ -1,5 +1,6 @@
 """Tracking on a synthetic video: a textured square moving over a noisy background.
 No camera and no network. MIL is always tested; VitTrack only if its model is cached."""
+import http.client
 import time
 
 import cv2
@@ -82,6 +83,16 @@ def test_offline_falls_back_to_mil(tmp_path, monkeypatch):
     assert track.make_backend("auto", model_dir=tmp_path).name == "mil"
     with pytest.raises(RuntimeError, match="VitTrack"):
         track.make_backend("vit", model_dir=tmp_path)
+
+
+@pytest.mark.parametrize("err", [OSError("no network"), http.client.IncompleteRead(b"partial", 100),
+                                 http.client.RemoteDisconnected("closed"), ValueError("bad url")])
+def test_any_download_failure_falls_back_to_mil(tmp_path, monkeypatch, err):
+    def broken(*a, **k):
+        raise err
+    monkeypatch.setattr(track.urllib.request, "urlopen", broken)
+    assert track.make_backend("auto", model_dir=tmp_path).name == "mil"
+    assert list(tmp_path.iterdir()) == [], "nothing half-written is left behind"
 
 
 @pytest.mark.skipif(not VIT, reason="VitTrack model not cached")

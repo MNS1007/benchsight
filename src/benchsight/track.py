@@ -20,6 +20,7 @@ Registry ideas adapted from VISTA (UMD Ironsite Hackathon 2025, Team Cortex)
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 import re
 import tempfile
@@ -89,7 +90,8 @@ def model_path(name: str = "vittrack", allow_download: bool = True, timeout: flo
             f.write(data)
         os.replace(tmp, path)
         return path
-    except OSError:  # URLError, timeouts, read-only disk: work without the model
+    except (OSError, http.client.HTTPException, ValueError):
+        # URLError, timeouts, truncated downloads, read-only disk: work without the model
         return None
 
 
