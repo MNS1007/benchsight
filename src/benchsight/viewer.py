@@ -4,7 +4,9 @@ annotations drawn on top. It is served on 127.0.0.1 only and runs only while ope
   /         the page
   /stream   the camera as MJPEG
   /overlay  the current annotations as JSON
-  /events   annotation updates as server-sent events
+  /events   annotation updates as server-sent events: the full state when the agent
+            draws, then "pos" events with only the anchored shapes that moved
+            (about 12 a second at most, and only when something changed)
 """
 from __future__ import annotations
 
@@ -15,7 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 
-from .overlay import COLORS
+from .overlay import COLORS, resolve
+
+PUSH_HZ = 12  # most position updates per second sent to the browser
 
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>benchsight</title>
@@ -26,6 +30,7 @@ PAGE = """<!DOCTYPE html>
   #cam{display:block;max-width:100vw;max-height:calc(100vh - 54px)}
   svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
   .new{animation:pop .5s ease-out}
+  .lost{opacity:.45}
   @keyframes pop{from{opacity:0}to{opacity:1}}
   #bar{height:54px;display:flex;align-items:center;gap:12px;padding:0 16px;background:#1b1b1b;border-top:1px solid #333}
   #caption{flex:1;font-size:17px}
@@ -43,36 +48,51 @@ const ns = 'http://www.w3.org/2000/svg';
 function el(tag, attrs, parent){ const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); (parent||ov).appendChild(e); return e; }
 function label(x, y, text, color){
   if (!text) return;
-  el('text', {x: S(x)+10, y: S(y)-10, fill: color, 'font-size': 34, 'font-weight': 700, stroke: '#000', 'stroke-width': 6, 'paint-order': 'stroke'}).textContent = text;
+  const t = el('text', {x: S(x)+10, y: S(y)-10, fill: color, 'font-size': 34, 'font-weight': 700, stroke: '#000', 'stroke-width': 6, 'paint-order': 'stroke'});
+  t.textContent = text;
+  return t;
 }
-function draw(state){
+let cur = null;
+function draw(state, fresh){
+  cur = state;
   ov.innerHTML = '';
   const defs = el('defs', {});
   for (const name in COLORS){
     const m = el('marker', {id: 'h-'+name, markerWidth: 6, markerHeight: 6, refX: 5, refY: 3, orient: 'auto'}, defs);
     el('path', {d: 'M0,0 L6,3 L0,6 z', fill: COLORS[name]}, m);
   }
-  const g = el('g', {class: 'new'});
+  const top = el('g', fresh ? {class: 'new'} : {});
   for (const s of state.shapes){
     const c = COLORS[s.color];
+    const g = s.lost ? el('g', {class: 'lost'}, top) : top;
     const line = {stroke: c, 'stroke-width': 8, fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round'};
-    if (s.type === 'arrow'){ el('line', {...line, x1: S(s.from[0]), y1: S(s.from[1]), x2: S(s.to[0]), y2: S(s.to[1]), 'marker-end': 'url(#h-'+s.color+')'}, g); label(s.from[0], s.from[1], s.label, c); }
-    if (s.type === 'circle'){ el('ellipse', {...line, cx: S(s.at[0]), cy: S(s.at[1]), rx: S(s.r), ry: S(s.r)}, g); label(s.at[0]+s.r, s.at[1], s.label, c); }
-    if (s.type === 'box'){ el('rect', {...line, x: S(s.box[0]), y: S(s.box[1]), width: S(s.box[2]-s.box[0]), height: S(s.box[3]-s.box[1])}, g); label(s.box[0], s.box[1], s.label, c); }
-    if (s.type === 'path'){ el('polyline', {...line, points: s.points.map(p => S(p[0])+','+S(p[1])).join(' ')}, g); const e = s.points[s.points.length-1]; label(e[0], e[1], s.label, c); }
-    if (s.type === 'text'){ label(s.at[0], s.at[1], s.text, c); }
+    if (s.lost) line['stroke-dasharray'] = '18 14';
+    const tag = t => s.lost ? (t ? t + ' (lost)' : 'lost') : t;
+    const lab = (x, y, t) => { if (tag(t)) { const L = label(x, y, tag(t), c); if (L && s.lost) g.appendChild(L); } };
+    if (s.type === 'arrow'){ el('line', {...line, x1: S(s.from[0]), y1: S(s.from[1]), x2: S(s.to[0]), y2: S(s.to[1]), 'marker-end': 'url(#h-'+s.color+')'}, g); lab(s.from[0], s.from[1], s.label); }
+    if (s.type === 'circle'){ el('ellipse', {...line, cx: S(s.at[0]), cy: S(s.at[1]), rx: S(s.r), ry: S(s.r)}, g); lab(s.at[0]+s.r, s.at[1], s.label); }
+    if (s.type === 'box'){ el('rect', {...line, x: S(s.box[0]), y: S(s.box[1]), width: S(s.box[2]-s.box[0]), height: S(s.box[3]-s.box[1])}, g); lab(s.box[0], s.box[1], s.label); }
+    if (s.type === 'path'){ el('polyline', {...line, points: s.points.map(p => S(p[0])+','+S(p[1])).join(' ')}, g); const e = s.points[s.points.length-1]; lab(e[0], e[1], s.label); }
+    if (s.type === 'text'){ lab(s.at[0], s.at[1], s.text); }
   }
   cap.textContent = state.caption || (state.shapes.length ? '' : 'Waiting for the agent.');
 }
-fetch('/overlay').then(r => r.json()).then(draw);
+fetch('/overlay').then(r => r.json()).then(s => { if (!cur || s.version > cur.version) draw(s, true); });  // events may arrive first
 const ev = new EventSource('/events');
-ev.onmessage = m => draw(JSON.parse(m.data));
+ev.onmessage = m => { const s = JSON.parse(m.data); draw(s, !cur || s.version !== cur.version); };
+ev.addEventListener('pos', m => {  // only the anchored shapes that moved
+  const p = JSON.parse(m.data);
+  if (!cur || p.version !== cur.version) return;
+  for (const i in p.shapes) cur.shapes[i] = p.shapes[i];
+  draw(cur, false);
+});
 </script></body></html>"""
 
 
 class Viewer:
-    def __init__(self, feed, overlay, host: str = "127.0.0.1", port: int = 0, quality: int = 80):
-        self.feed, self.overlay, self.quality = feed, overlay, quality
+    def __init__(self, feed, overlay, host: str = "127.0.0.1", port: int = 0, quality: int = 80, tracker=None):
+        """tracker: anything with objects() (a track.Tracker); anchored shapes follow it."""
+        self.feed, self.overlay, self.quality, self.tracker = feed, overlay, quality, tracker
         viewer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -85,7 +105,7 @@ class Viewer:
                         body = PAGE.replace("__COLORS__", json.dumps({k: v[1] for k, v in COLORS.items()})).encode()
                         self._send(200, "text/html; charset=utf-8", body)
                     elif self.path == "/overlay":
-                        self._send(200, "application/json", json.dumps(viewer.overlay.state()).encode())
+                        self._send(200, "application/json", json.dumps(viewer.state()).encode())
                     elif self.path == "/stream":
                         viewer._stream(self)
                     elif self.path == "/events":
@@ -133,17 +153,35 @@ class Viewer:
                     h.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
             time.sleep(period)
 
+    def state(self, state: dict | None = None) -> dict:
+        """The annotations with anchored shapes at their objects' current boxes, rounded
+        to 0.1% of the frame so sub-pixel jitter is not sent."""
+        state = self.overlay.state() if state is None else state
+        return resolve(state, self.tracker.objects(), digits=3) if self.tracker is not None else state
+
     def _events(self, h):
         h.send_response(200)
         h.send_header("Content-Type", "text/event-stream")
         h.send_header("Cache-Control", "no-store")
         h.end_headers()
-        seen = -1
+        seen, sent, wrote = -1, [], time.time()
         while not self._stopped.is_set():
-            state = self.overlay.wait(seen, timeout=15)
-            if state["version"] == seen:
-                h.wfile.write(b": keepalive\n\n")  # also detects a closed tab
-            else:
-                seen = state["version"]
+            follow = self.tracker is not None and self.overlay.anchored
+            state = self.overlay.wait(seen, timeout=1.0 / PUSH_HZ if follow else 15)
+            if self._stopped.is_set():
+                break
+            state = self.state(state)
+            if state["version"] != seen:
+                seen, sent = state["version"], state["shapes"]
                 h.wfile.write(b"data: " + json.dumps(state).encode() + b"\n\n")
+            else:
+                moved = {i: s for i, (s, old) in enumerate(zip(state["shapes"], sent)) if s != old}
+                if moved:
+                    sent = state["shapes"]
+                    h.wfile.write(b"event: pos\ndata: " + json.dumps({"version": seen, "shapes": moved}).encode() + b"\n\n")
+                elif time.time() - wrote >= 15:
+                    h.wfile.write(b": keepalive\n\n")  # also detects a closed tab
+                else:
+                    continue
+            wrote = time.time()
             h.wfile.flush()

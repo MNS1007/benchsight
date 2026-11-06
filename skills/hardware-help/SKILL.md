@@ -10,8 +10,14 @@ description: Use the bench camera (benchsight MCP tools) to see and debug physic
 3. For anything that moves or happens over time (a servo sweep, a calibration pose, seating a cable), use `watch`.
 4. Before saying something is wrong, check it against the build docs (a playbook in `playbooks/`, the project README, or the vendor guide) and quote the step.
 5. Show the exact spot with `point` and say what to change in one short sentence.
-   For a multi-step job (assembly, wiring, calibration), use `open_viewer` and guide on the live view with `annotate`: red for wrong, green for right, a yellow arrow for where to move something, and one short caption. Check placement with `look(with_annotations=True)`, and redraw if the camera moved. Call `close_viewer` when done, so the camera turns off.
-6. Say plainly when the photo cannot settle it, and what would: another angle, a multimeter reading, or a terminal command.
-7. Connect what you see to the terminal: if a script failed, read its error and check whether the hardware explains it (wrong ID, unplugged cable, wrong port).
+6. For a multi-step job (assembly, wiring, calibration), guide on the live view:
+   1. `open_viewer`, then a wide `look` (no zoom).
+   2. `track` the parts you will talk about, with boxes as fractions of that look and short labels. Keep the returned ids.
+   3. `annotate` with `"anchor": "<id>"` on each shape so it follows its part: red for wrong, green for right, a yellow arrow for where to move something, one short caption. Check placement with `look(with_annotations=True)`.
+   4. Optional, in Claude Code: while the user works, run `benchsight events --follow` with the background Monitor tool (add `--dir <folder>` if BENCHSIGHT_DIR is set). Each line is an event (`object_lost`, `object_found`, `scene_changed`, `still`); on one, `look` and redraw. A Monitor lasts 30 minutes at most; re-arm it if the job goes on.
+   5. Use `objects()` for cheap position checks instead of new photos. A shape shown "(lost)" means its part is hidden or moved away; look again and `track` it again if it doesn't come back.
+   6. At the end: stop the Monitor, `close_viewer` (camera off), then `cleanup` to delete the session's saved images.
+7. Say plainly when the photo cannot settle it, and what would: another angle, a multimeter reading, or a terminal command.
+8. Connect what you see to the terminal: if a script failed, read its error and check whether the hardware explains it (wrong ID, unplugged cable, wrong port).
 
-Never take photos the user didn't ask for, and don't keep taking them in a loop.
+Never take photos the user didn't ask for, and don't keep taking them in a loop: wake on events instead.
