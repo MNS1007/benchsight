@@ -6,7 +6,7 @@ When you're wiring up a robot arm or other hardware and get stuck, the usual loo
 
 benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with Claude Code, Claude Desktop, Cursor and any other MCP client.
 
-> Status: early (v0.0.1). The image tools are tested; real-camera testing on different machines is still ongoing. Object tracking and wake-up events are tested on synthetic video only, and their thresholds are not yet tuned on a real bench camera. Issues and reports are welcome.
+> Status: early (v0.0.1). The image tools are tested; real-camera testing on different machines is still ongoing. Object tracking, wake-up events and recording are tested on synthetic video only, and their thresholds are not yet tuned on a real bench camera. Issues and reports are welcome.
 
 ---
 
@@ -24,6 +24,7 @@ benchsight is an [MCP](https://modelcontextprotocol.io) server, so it works with
 - [Allow camera access](#allow-camera-access)
 - [Use it](#use-it)
 - [The live viewer](#the-live-viewer)
+- [Record and review ("start watching")](#record-and-review-start-watching)
 - [How tracking works](#how-tracking-works)
 - [Disk space and cleanup](#disk-space-and-cleanup)
 - [Settings](#settings)
@@ -154,8 +155,12 @@ Tools the agent can call:
 | `untrack` | Stops tracking parts, and removes the drawings anchored to them | `ids` (default: all) |
 | `annotate` | Draws on the live viewer: arrows, circles, boxes, freehand strokes and text, plus a one-line instruction under the video. A shape with `"anchor": "<id>"` follows that tracked part | `shapes` (list), `caption`, `replace` (default true) |
 | `clear_annotations` | Removes all drawings from the viewer | none |
-| `close_viewer` | Closes the viewer, stops tracking and turns the camera off | none |
-| `cleanup` | Deletes the photos and events file this session has saved so far, and says how much space it freed. They are deleted anyway when the session ends | none |
+| `start_recording` | Starts saving small frames from the live viewer, so the agent can review what happened afterwards (see [Record and review](#record-and-review-start-watching)). Needs the viewer open; a red REC badge shows on it | `roi`: the work area `[x1, y1, x2, y2]` as fractions (default: whole frame), `fps` (default 8, at most 15), `max_seconds` (default 300, at most 900) |
+| `stop_recording` | Stops the recording and says how long it ran, how many frames it saved, and the stretches where the work area changed (a hint only) | none |
+| `review` | One sheet of frames from the recording, spread evenly over a time window, each labeled with its number and time ("3  4.2s"). Works after the recording stops, and on what is saved so far while it runs | `start_s`, `end_s` (default: all of it), `frames` (2 to 24, default 12), `max_side` (default 1600), `recording` (a `rec-...` folder name; default: this session's last one) |
+| `review_video` | The same labeled sheet from any local video file, such as a LeRobot dataset episode. The video is read in place, never copied | `path`, `start_s`, `end_s`, `frames`, `max_side` |
+| `close_viewer` | Closes the viewer, stops tracking and any recording, and turns the camera off. A stopped recording can still be reviewed | none |
+| `cleanup` | Deletes the photos, recordings and events file this session has saved so far, and says how much space it freed. A recording in progress is stopped first. They are deleted anyway when the session ends | none |
 
 `look` also takes `with_annotations` (default false). With it, the agent gets the photo with its own drawings on it, so it can check they landed in the right place.
 
@@ -171,8 +176,9 @@ You also get:
   2. check what it sees against the build docs;
   3. circle the exact part, or, on the live viewer, track the parts and draw on them;
   4. optionally wake on tracker events while you work, instead of taking photos in a loop;
-  5. say when a photo can't settle the question;
-  6. close the viewer and clean up at the end.
+  5. when you say "start watching", record while you work and review it when you say stop;
+  6. say when a photo can't settle the question;
+  7. close the viewer and clean up at the end.
 - **Playbooks:** short checklists for common builds. The first one is the LeRobot SO-101 arm.
 
 ---
@@ -374,7 +380,8 @@ Open the printed file. If it's black or the command fails, see [Troubleshooting]
    - "Look at the cable on servo 3 and tell me if it's fully seated."
    - "Watch the gripper while I run the calibration and tell me where it stops."
    - "Which pin does the yellow wire go to? Point at it."
-3. The agent calls `look`, `watch` or `point`, or opens the [live viewer](#the-live-viewer) and tracks the parts. Claude Code asks your permission the first time it uses each tool.
+   - "Start watching while I teleoperate the arm. When I say stop, tell me what went wrong." (see [Record and review](#record-and-review-start-watching))
+3. The agent calls `look`, `watch` or `point`, records and reviews, or opens the [live viewer](#the-live-viewer) and tracks the parts. Claude Code asks your permission the first time it uses each tool.
 4. Pair it with the terminal. If a script just failed, say so. The agent can read the error and check whether the hardware explains it: a wrong servo ID, an unplugged cable, the wrong port.
 
 Tips:
@@ -444,6 +451,44 @@ Each line looks like this:
 
 ---
 
+## Record and review ("start watching")
+
+**The agent cannot watch live video.** It sees the bench only through the images a tool returns, one call at a time, so it can't follow a 2-minute teleoperation run as it happens. What it can do is review a recording afterwards. So when you say "start watching", it records; when you say "stop", it looks back over what happened and tells you.
+
+**How it works:**
+1. The agent opens the viewer (`open_viewer`), takes a wide `look`, and calls `start_recording` with an `roi` box around the work area (the arm, the part you're assembling). A red **● REC 0:42** badge with a running clock appears on the viewer while it records, and goes away when it stops.
+2. You work. The agent waits; it takes no photos in the meantime.
+3. When you say stop, the agent calls `stop_recording`. It gets how long the recording ran, how many frames it saved, and the stretches where the work area changed.
+4. It calls `review()` for an overview: one sheet of 12 frames spread **evenly** over the whole recording, each labeled with its number and time, like "3  4.2s".
+5. It zooms on the moments that matter, `review(start_s, end_s)`, for example `review(38, 44)` for a closer look at what happened between 38 s and 44 s, and repeats until it can tell what happened.
+6. It describes what happened and when, and says what it couldn't see.
+
+**The activity hint.** Each frame gets a score for how much of the `roi` changed since the previous one, and `stop_recording` turns that into stretches of activity, like `[[12.4, 19.8], [38.1, 44.0]]`. The score compares edges and normalized patches rather than raw brightness, so auto-exposure, a dimming room or a flickering light score about zero, and it ignores tiny speckle and anything outside the `roi`. But it is **only a hint**: it can miss slow or small motion, such as a screw that loosens or a cable that slowly slips. Frames for `review` are always picked evenly in time, never by activity, and the agent decides where to zoom.
+
+**Storage.** Frames are saved as small JPEGs (longest side 640 px) at 8 a second by default, into a `rec-<date>-<time>/` folder in the photo folder, next to an `index.jsonl` with one line per frame (number, time, file, activity). A recording stops by itself after 5 minutes by default (`max_seconds`, at most 15 minutes), when the viewer closes, or when the camera stops sending frames (frozen or unplugged; `stop_recording` says so). Only one recording runs at a time. A 5-minute recording is 2,400 frames, which is often on the order of 100 MB, depending on the scene.
+
+**Deletion.** Recordings are deleted like photos: when the session ends, when the agent calls `cleanup` (which stops a recording in progress first), after 24 hours at the latest, or by hand with `benchsight clean`. See [Disk space and cleanup](#disk-space-and-cleanup).
+
+**Privacy.** Recording happens only when you ask for it, and only while the live viewer is open: `start_recording` refuses if it isn't, and `close_viewer` stops it. The REC badge shows whenever it runs. Frames stay on your machine; only the sheets the agent asks for in `review` are sent to the model, as with any photo.
+
+**Copy-paste prompt:**
+
+```text
+Start watching while I <run the SO-101 calibration>. Use the benchsight tools:
+1. Open the live viewer (open_viewer) if it isn't open, take a wide look, then call
+   start_recording with an roi around the work area. Tell me when the REC badge is on.
+2. Don't take photos while I work. Wait until I say stop.
+3. When I say stop: stop_recording, then review() for an even overview of the whole
+   run, then review(start_s, end_s) to zoom on the moments that matter. The activity
+   stretches are only a hint; check the quiet parts too.
+4. Tell me what went wrong and when (the time in seconds), and what you couldn't see.
+   Don't claim you watched it live.
+```
+
+**LeRobot dataset episodes.** `review_video` makes the same labeled sheets from any local video file, so the agent can look back over an episode you recorded with LeRobot. Dataset videos are usually under `~/.cache/huggingface/lerobot/<repo_id>/videos/...` (one mp4 per camera and episode). Ask: "Review episode 3's wrist camera video and tell me where the grasp fails." It needs no viewer or camera, reads the video in place and saves no copy of it; only the sheet it returns is saved, like any other image.
+
+---
+
 ## How tracking works
 
 benchsight does not ship an object detector. **The agent is the labeller**: it already understands the photo, so it names each part and gives a rough box. benchsight's job is only to keep that box on the part afterwards, cheaply and on the CPU, while the viewer is open.
@@ -474,7 +519,7 @@ Before the budget and the cheaper settings, the same benchmark used much more: 1
 
 ## Disk space and cleanup
 
-benchsight saves every photo, zoom, contact sheet and annotated image it sends to the agent, in the photo folder (`.benchsight/` in the folder the server starts in, or `BENCHSIGHT_DIR`). So it doesn't fill your disk:
+benchsight saves every photo, zoom, contact sheet and annotated image it sends to the agent, and the frames of each [recording](#record-and-review-start-watching), in the photo folder (`.benchsight/` in the folder the server starts in, or `BENCHSIGHT_DIR`). So it doesn't fill your disk:
 
 - **When the session ends, its files are deleted.** That is when your agent closes the server, or the server exits or gets SIGTERM, SIGINT or SIGHUP. Only files this session wrote are deleted, plus the events file. Set `BENCHSIGHT_KEEP=1` to keep them.
 - **24-hour backstop.** Each new photo also deletes benchsight photos older than 24 hours, in case a session was killed hard (for example with `kill -9`).
@@ -485,14 +530,14 @@ benchsight saves every photo, zoom, contact sheet and annotated image it sends t
 benchsight clean --dry-run          # list benchsight files older than 24 h
 benchsight clean                    # delete them
 benchsight clean --older-than 2     # older than 2 hours
-benchsight clean --all              # every benchsight file, whatever its age
+benchsight clean --all              # every benchsight file and recording, whatever its age
 benchsight clean --dir /path/to/photos
 benchsight clean --agent-cache --dry-run   # also Claude Code's own copies (see below)
 ```
 
 - **Claude Code keeps its own copies.** When a tool returns an image, Claude Code saves a copy under `~/.claude/projects/<project>/<session>/tool-results/` named `mcp-benchsight-blob-*`. benchsight's session cleanup does not touch these. `benchsight clean --agent-cache` deletes them, with the same 24-hour rule unless you add `--all`, so a running session's recent images stay. It also looks in `CLAUDE_CONFIG_DIR` if you set it.
 
-What benchsight will delete is deliberately narrow, because `BENCHSIGHT_DIR` can point anywhere: only regular files directly in the photo folder, named the way benchsight names them (like `20261105-151449-812-look.jpg`), and `events.jsonl`. With `--agent-cache`, only files named `mcp-benchsight-blob-*` in a `tool-results` folder. It never deletes folders, symlinks, or other files, even ones next to its own.
+What benchsight will delete is deliberately narrow, because `BENCHSIGHT_DIR` can point anywhere: only regular files directly in the photo folder, named the way benchsight names them (like `20261105-151449-812-look.jpg`), and `events.jsonl`; and recording folders directly in the photo folder, named like `rec-20261105-151449`. Inside a recording folder it deletes only the frames (`000000.jpg` ...) and `index.jsonl`, then removes the folder once it is empty; it never deletes a folder recursively. With `--agent-cache`, only files named `mcp-benchsight-blob-*` in a `tool-results` folder. It never deletes other folders, symlinks, or other files, even ones next to its own.
 
 One caveat: `events.jsonl` is shared by every session that uses the same photo folder. Ending one session deletes it even if another session is still writing to it. Only past lines are lost; new events keep coming.
 
@@ -502,14 +547,14 @@ One caveat: `events.jsonl` is shared by every session that uses the same photo f
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos and `events.jsonl` are saved |
+| `BENCHSIGHT_DIR` (environment variable) | `.benchsight` in the folder the server starts in | Where photos, recordings and `events.jsonl` are saved |
 | `BENCHSIGHT_KEEP` (environment variable) | unset | Set to `1` to keep this session's files when it ends. The 24-hour backstop still applies |
 | `BENCHSIGHT_MODELS` (environment variable) | `~/.cache/benchsight/models` | Where the VitTrack model file is downloaded and kept |
 | `cam` (tool input) | `0` | Which camera to use |
 | `BENCHSIGHT_PORT` (environment variable) | random free port | Port for the live viewer, if you want a fixed address |
 | `BENCHSIGHT_TRACKER` (environment variable) | `auto` | Object tracker: `auto` (VitTrack if its model is available, else MIL), `vit` or `mil` |
 | `BENCHSIGHT_CPU` (environment variable) | `0.15` | Share of one core tracking aims to stay under. `0` means no limit: every object updates every frame |
-| `max_side` (tool input) | 1280 (`look`, `point`), 1600 (`watch`) | Longest side of the image sent to the agent. Smaller means faster and fewer tokens |
+| `max_side` (tool input) | 1280 (`look`, `point`), 1600 (`watch`, `review`, `review_video`) | Longest side of the image sent to the agent. Smaller means faster and fewer tokens |
 
 To set one in Claude Code, add `-e NAME=value` (repeat it for more):
 
@@ -524,11 +569,11 @@ In Claude Desktop, Cursor and other clients, add an `"env": {"BENCHSIGHT_DIR": "
 ## Privacy
 
 - **No hidden photos.** A photo is taken only when the agent calls a tool, and your client asks you before the first call. The camera stays on between photos only while the live viewer is open, until `close_viewer`.
-- **No recording, also with the viewer open.** The live viewer and the tracker keep frames in memory only. They save nothing to disk except the small `events.jsonl` (event names and part labels, no images).
-- **Photos stay on your machine.** They're saved in the photo folder (see [Settings](#settings)) and deleted when the session ends, or after 24 hours at the latest. See [Disk space and cleanup](#disk-space-and-cleanup).
+- **Recording only on request, and visible.** The live viewer and the tracker keep frames in memory only, and save nothing to disk except the small `events.jsonl` (event names and part labels, no images). Frames are saved only after the agent calls `start_recording`, only while the viewer is open, with a red REC badge on it the whole time. `close_viewer` stops it. See [Record and review](#record-and-review-start-watching).
+- **Photos and recordings stay on your machine.** They're saved in the photo folder (see [Settings](#settings)) and deleted when the session ends, or after 24 hours at the latest. See [Disk space and cleanup](#disk-space-and-cleanup).
 - **Your agent may keep its own copies.** Claude Code saves each image a tool returns in its session folder under `~/.claude/projects/`. Delete those with `benchsight clean --agent-cache`.
 - **Tracking runs locally.** The trackers run on your CPU. The only download is the VitTrack model file, once, from GitHub; no images are sent for it.
-- **The only thing sent anywhere** is the photo the agent asked for, to the model you already use. Tracking sends nothing.
+- **The only thing sent anywhere** is the photo or review sheet the agent asked for, to the model you already use. Tracking sends nothing.
 - Many webcams turn on a light while the camera is in use, so you can see when a photo is taken.
 
 Add `.benchsight/` to your project's `.gitignore` so photos are never committed.
@@ -573,8 +618,11 @@ To save CPU, parts take turns updating. Set `BENCHSIGHT_CPU=0` to update every p
 **`benchsight events --follow` prints nothing**
 Events are written only while the viewer is open, and only when something happens. Check that it reads the right folder: use the `watch` command from `open_viewer`, which has the absolute `--dir`. A stray `./.benchsight` in the folder you run it from wins over the server's folder. `benchsight events` without `--follow` prints the last 20 lines.
 
+**`start_recording` says "open the viewer first"**
+Recording uses the live viewer's camera feed, and the camera runs only while the viewer is open. Ask the agent to call `open_viewer` first.
+
 **The photo folder is getting big**
-Run `benchsight clean --dry-run` to see what is there, then `benchsight clean` (or `--all`). See [Disk space and cleanup](#disk-space-and-cleanup).
+Recordings are the biggest files. Run `benchsight clean --dry-run` to see what is there, then `benchsight clean` (or `--all`). See [Disk space and cleanup](#disk-space-and-cleanup).
 
 ---
 
@@ -620,6 +668,7 @@ src/benchsight/viewer.py   the local live-viewer web page
 src/benchsight/track.py    object tracking: VitTrack/MIL, lost and found, scene memory, CPU budget
 src/benchsight/motion.py   camera motion from optical flow and ORB
 src/benchsight/events.py   wake-up events and their debouncer, events --follow
+src/benchsight/recording.py recording, the activity hint, uniform sampling and review sheets
 src/benchsight/cleanup.py  deleting saved files at session end and on demand
 src/benchsight/cli.py      the benchsight CLI (snap, cameras, events, clean)
 scripts/bench_tracking.py  CPU and fps benchmark for tracking (no camera)
@@ -656,6 +705,7 @@ Done:
 - Live viewer with drawings that follow tracked parts, on the CPU.
 - Wake-up events (`benchsight events --follow`), so the agent can react to the bench instead of polling it.
 - Session-end cleanup of saved images, and `benchsight clean`.
+- Record and review ("start watching"): record on request, then review evenly and zoom; `review_video` for LeRobot episodes.
 
 Next:
 
