@@ -281,3 +281,74 @@ def test_agent_cache_respects_age_and_is_off_by_default(tmp_path, monkeypatch, c
     assert all(p.exists() for p in ours)
     cli.main(["clean", "--dir", str(tmp_path / "store"), "--agent-cache"])
     assert not ours[0].exists() and ours[1].exists(), "a running session's young copies stay"
+
+
+# ── recording folders ──
+
+def rec(store, name="rec-20260101-000000", n=3, old=False):
+    """A recording folder as recording.py writes it."""
+    folder = store / name
+    folder.mkdir(parents=True)
+    files = [folder / f"{i:06d}.jpg" for i in range(n)] + [folder / "index.jsonl"]
+    for p in files:
+        p.write_bytes(b"r" * 10)
+        if old:
+            os.utime(p, (OLD, OLD))
+    return folder, files
+
+
+def test_session_end_deletes_a_recording_folder_and_only_its_files(tmp_path):
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    cleanup.record(folder, store)
+    for p in files:
+        cleanup.record(p, store)
+    assert cleanup.session_end() == (len(files), 10 * len(files))
+    assert not folder.exists()
+
+
+def test_a_recording_folder_with_foreign_files_stays(tmp_path):
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    (folder / "mine.txt").write_text("keep")
+    cleanup.record(folder, store)
+    for p in files + [folder / "mine.txt"]:
+        cleanup.record(p, store)
+    assert cleanup.session_end()[0] == len(files)
+    assert folder.is_dir() and (folder / "mine.txt").exists()
+
+
+def test_recording_lookalikes_are_never_touched(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    deep = store / "sub" / "rec-20260101-000000"  # not directly in the store
+    deep.mkdir(parents=True)
+    (deep / "000000.jpg").write_bytes(b"x")
+    target = tmp_path / "elsewhere"  # a symlinked recording folder
+    target.mkdir()
+    (target / "000000.jpg").write_bytes(b"x")
+    (store / "rec-20260101-000001").symlink_to(target, target_is_directory=True)
+    odd = store / "recording-1"  # not a benchsight folder name
+    odd.mkdir()
+    (odd / "000000.jpg").write_bytes(b"x")
+    for p in (deep / "000000.jpg", store / "rec-20260101-000001" / "000000.jpg", odd / "000000.jpg",
+              deep, store / "rec-20260101-000001", odd):
+        cleanup.record(p, store)
+    assert cleanup.session_end() == (0, 0)
+    assert (deep / "000000.jpg").exists() and (target / "000000.jpg").exists() and (odd / "000000.jpg").exists()
+    names = {p.name for p, _ in cleanup.store_files(store, None)}
+    assert names == set()
+
+
+def test_store_files_and_clean_include_recordings(tmp_path, capsys):
+    from benchsight import cli
+    old_folder, old_files = rec(tmp_path, "rec-20200101-000000", old=True)
+    new_folder, new_files = rec(tmp_path, "rec-20990101-000000-2")
+    listed = {p for p, _ in cleanup.store_files(tmp_path)}
+    assert listed == set(old_files)
+    cli.main(["clean", "--dir", str(tmp_path)])
+    assert not old_folder.exists() and new_folder.is_dir()
+    assert "4 files deleted, 40 B freed" in capsys.readouterr().out
+    cli.main(["clean", "--dir", str(tmp_path), "--all"])
+    assert not new_folder.exists()
+    assert "4 files deleted" in capsys.readouterr().out
