@@ -28,7 +28,8 @@ from .viewer import Viewer
 mcp = MCPServer("benchsight")
 _last = None  # the last full frame taken, for point() and track()
 overlay = Overlay()
-_live: dict = {"feed": None, "viewer": None, "tracker": None, "tracker_error": "", "recorder": None}
+_live: dict = {"feed": None, "viewer": None, "tracker": None, "tracker_error": "", "recorder": None,
+               "last_recording": None}  # the folder this session last recorded into, for review()
 _look_boxes: dict[str, list[float]] = {}  # tracked boxes as they were in the last look
 
 
@@ -275,7 +276,7 @@ def start_recording(roi: list[float] | None = None, fps: float = 8, max_seconds:
         raise
     except Exception as err:  # already recording, camera gone, disk full or read-only
         raise ValueError(f"could not start recording: {err}") from err
-    _live["recorder"] = rec
+    _live["recorder"], _live["last_recording"] = rec, rec.folder
     return {"ok": True, "folder": str(rec.folder), "fps": rec.fps, "max_seconds": rec.max_seconds,
             "roi": list(rec.roi) if rec.roi else None,
             "note": f"Recording (stops by itself after {rec.max_seconds:g} s). Let the builder work, "
@@ -302,15 +303,27 @@ def stop_recording() -> dict:
 
 @mcp.tool()
 def review(start_s: float | None = None, end_s: float | None = None, frames: int = 12,
-           max_side: int = 1600, recording: str | None = None) -> Image:
-    """One sheet of frames from the last recording (or the named rec-... folder), spread
-    evenly over [start_s, end_s] (default: all of it), each labeled with its number and
-    time ("3  4.2s"). Start with review() for the whole run, then zoom: review(4.0, 7.0)
-    to see what happened between 4 s and 7 s. You pick the moments; frames are never
-    chosen by activity. frames: 2-24. Works while still recording, on what is saved so far."""
-    folder = rec_mod.find(camera.STORE, recording)
-    shot, _ = rec_mod.review(folder, start_s, end_s, max(2, min(int(frames), 24)), max(320, min(int(max_side), 2400)))
-    return Image(data=shot.jpeg, format="jpeg")
+           max_side: int = 1600, recording: str | None = None) -> list[str | Image]:
+    """One sheet of frames from this session's last recording (or the named rec-... folder),
+    spread evenly over [start_s, end_s] (default: all of it), each labeled with its number
+    and time ("3  4.2s"), after a line naming the recording and the span shown. Start with
+    review() for the whole run, then zoom: review(4.0, 7.0) to see what happened between
+    4 s and 7 s. You pick the moments; frames are never chosen by activity. frames: 2-24.
+    Works while still recording, on what is saved so far."""
+    if recording:
+        folder = rec_mod.find(camera.STORE, recording)
+    elif _live["last_recording"] is not None:
+        folder = _live["last_recording"]
+    else:
+        raise ValueError("no recording in this session: start_recording first "
+                         "(or name an older one with recording='rec-...')")
+    shot, shown = rec_mod.review(folder, start_s, end_s, max(2, min(int(frames), 24)), max(320, min(int(max_side), 2400)))
+    index = rec_mod.load_index(folder)
+    rec = rec_mod.current()
+    going = " (still recording)" if rec is not None and rec.folder == folder else ""
+    head = (f"{folder.name}, started {rec_mod.started(folder)}: {len(shown)} frame{'s' if len(shown) != 1 else ''} from "
+            f"{shown[0]['t']:.1f}s to {shown[-1]['t']:.1f}s of {index[-1]['t']:.1f}s recorded{going}.")
+    return [head, Image(data=shot.jpeg, format="jpeg")]
 
 
 @mcp.tool()
@@ -352,6 +365,7 @@ def cleanup_files() -> dict:
     this session has saved so far (they are deleted anyway when the session ends). A
     recording in progress is stopped first. Returns how many files and bytes were freed."""
     n, freed = cleanup.session_end()
+    _live["last_recording"] = None  # its frames are gone
     return {"ok": True, "files": n, "bytes": freed, "freed": cleanup.human(freed)}
 
 

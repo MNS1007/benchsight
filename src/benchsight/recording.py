@@ -333,6 +333,16 @@ def find(store: Path | str, name: str | None = None) -> Path:
     return found[-1]
 
 
+def started(folder: Path | str) -> str:
+    """When a recording began, from its folder name: rec-20261106-090000 -> 2026-11-06 09:00:00."""
+    parts = Path(folder).name.split("-")
+    try:
+        d, t = parts[1], parts[2]
+        return f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]}:{t[4:]}"
+    except IndexError:
+        return "?"
+
+
 def labeled_sheet(items: list[tuple[float, np.ndarray]], max_side: int = 1600) -> np.ndarray:
     """One contact sheet of (seconds, frame) pairs, each tile labeled with its number and
     time ("3  4.2s"), fitted inside max_side. Tiles are sized first so labels stay readable."""

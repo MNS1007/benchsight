@@ -41,6 +41,7 @@ def live(monkeypatch, tmp_path):
     monkeypatch.setattr(camera, "ACTIVE", tmp_path / "active-store")
     monkeypatch.setattr(server, "_last", None)
     monkeypatch.setattr(recording, "_current", None)
+    monkeypatch.setitem(server._live, "last_recording", None)
     monkeypatch.setattr(cleanup, "_files", {})
     yield tmp_path / "store"
     server.close_viewer()
@@ -64,7 +65,7 @@ def test_recording_needs_the_viewer(live):
         server.start_recording()
     with pytest.raises(ValueError, match="start_recording first"):
         server.stop_recording()
-    with pytest.raises(ValueError, match="no recordings yet"):
+    with pytest.raises(ValueError, match="no recording in this session: start_recording first"):
         server.review()
 
 
@@ -77,7 +78,9 @@ def test_start_stop_and_review(live, monkeypatch):
     with pytest.raises(ValueError, match="already recording"):
         server.start_recording()
     assert wait_until(frames_saved(4))
-    assert server.review().data[:2] == b"\xff\xd8", "review works while recording"
+    head, sheet = server.review()
+    assert sheet.data[:2] == b"\xff\xd8", "review works while recording"
+    assert head.startswith(f"{folder.name}, started ") and head.endswith("(still recording).")
 
     out = server.stop_recording()
     assert out["stopped"] == "stopped" and out["frames"] >= 4 and out["folder"] == str(folder)
@@ -98,6 +101,27 @@ def test_start_stop_and_review(live, monkeypatch):
     assert asked[2][1:3] == (0.0, end / 2)
     with pytest.raises(ValueError, match="no recording"):
         server.review(recording="rec-20000101-000000")
+
+
+
+def test_review_shows_this_sessions_recording_not_the_newest_in_the_store(live):
+    server.open_viewer(open_browser=False)
+    folder = Path(server.start_recording(fps=15)["folder"])
+    assert wait_until(frames_saved(3))
+    server.stop_recording()
+    newer = live / "rec-20991231-235959"  # another session's, left in the shared store
+    newer.mkdir()
+    cv2.imwrite(str(newer / "000000.jpg"), np.zeros((60, 80, 3), np.uint8))
+    (newer / "index.jsonl").write_text('{"i": 0, "t": 0.0, "file": "000000.jpg", "activity": 0}\n')
+    assert recording.find(live).name == newer.name
+    head, _ = server.review(0.0, 0.0, frames=2)
+    assert head.startswith(f"{folder.name}, started ") and "1 frame from 0.0s to 0.0s of " in head
+    assert not head.endswith("(still recording).")
+    head, _ = server.review(recording=newer.name)
+    assert head.startswith("rec-20991231-235959, started 2099-12-31 23:59:59: 1 frame "), "a named one still works"
+    server.cleanup_files()
+    with pytest.raises(ValueError, match="no recording in this session"):
+        server.review()
 
 
 def test_a_bad_roi_is_refused(live):
@@ -150,7 +174,8 @@ def test_close_viewer_stops_the_recording(live):
     out = server.close_viewer()
     assert not rec.running and rec.reason == "stopped" and recording.current() is None
     assert out["recording"]["frames"] == len(rec.index) and server._live["recorder"] is None
-    assert server.review().data[:2] == b"\xff\xd8", "the recording can still be reviewed"
+    head, sheet = server.review()
+    assert sheet.data[:2] == b"\xff\xd8" and head.startswith(rec.folder.name), "the recording can still be reviewed"
 
 
 def test_cleanup_stops_and_deletes_the_recording(live):
