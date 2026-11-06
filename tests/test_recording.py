@@ -330,3 +330,17 @@ def test_review_samples_a_recording_into_one_saved_sheet(tmp_path):
         recording.review(rec.folder, 10.0, 20.0, store=store)
     cleanup.session_end()
     assert not rec.folder.exists() and not shot.path.exists()
+
+
+def test_a_failing_first_frame_does_not_leave_a_recording_on(tmp_path):
+    class Broken(Feed):
+        def latest(self):
+            raise OSError("No space left on device")
+    rec = recording.Recorder(Broken(), tmp_path, clock=Clock())
+    with pytest.raises(OSError, match="No space"):
+        rec.start(background=False)
+    assert recording.current() is None and not rec.running and rec.reason.startswith("error: ")
+    assert rec.stop()["stopped"].startswith("error: ")
+    b = recording.Recorder(Feed(), tmp_path, clock=Clock()).start(background=False)
+    assert recording.current() is b
+    b.stop()

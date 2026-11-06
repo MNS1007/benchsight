@@ -268,8 +268,10 @@ def start_recording(roi: list[float] | None = None, fps: float = 8, max_seconds:
         raise ValueError(f"already recording into {_live['recorder'].folder.name}; call stop_recording first")
     try:
         rec = rec_mod.Recorder(feed, camera.STORE.resolve(), fps=fps, max_seconds=max_seconds, roi=roi).start()
-    except RuntimeError as err:
-        raise ValueError(str(err)) from err
+    except ValueError:
+        raise
+    except Exception as err:  # already recording, camera gone, disk full or read-only
+        raise ValueError(f"could not start recording: {err}") from err
     _live["recorder"] = rec
     return {"ok": True, "folder": str(rec.folder), "fps": rec.fps, "max_seconds": rec.max_seconds,
             "roi": list(rec.roi) if rec.roi else None,

@@ -175,9 +175,13 @@ class Recorder:
             _current = self
         self._start = self.clock()
         self._next = self._start
-        if self.capture() and background:
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
+        try:
+            if self.capture() and background:
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+        except Exception as err:  # disk full, read-only store: do not stay "recording"
+            self._finish(f"error: {err}", self.clock())
+            raise
         return self
 
     def _make_folder(self) -> Path:

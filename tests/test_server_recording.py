@@ -107,6 +107,20 @@ def test_a_bad_roi_is_refused(live):
     assert server._live["recorder"] is None and recording.current() is None
 
 
+def test_a_failing_first_frame_is_refused_and_recording_still_works(live, monkeypatch):
+    server.open_viewer(open_browser=False)
+    feed = server._live["feed"]
+    real = feed.latest
+    monkeypatch.setattr(feed, "latest", lambda: (_ for _ in ()).throw(OSError("Read-only file system")))
+    with pytest.raises(ValueError, match="could not start recording: Read-only"):
+        server.start_recording()
+    assert server._live["recorder"] is None and recording.current() is None
+    assert server._live["viewer"].rec() == {"recording": False}, "no REC badge left on"
+    monkeypatch.setattr(feed, "latest", real)
+    server.start_recording(fps=15)
+    assert wait_until(frames_saved(1))
+
+
 def test_stop_after_the_cap_still_gives_the_summary(live, monkeypatch):
     server.open_viewer(open_browser=False)
     monkeypatch.setattr(recording, "MAX_SECONDS", 0.3)
