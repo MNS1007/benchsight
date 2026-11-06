@@ -154,6 +154,19 @@ def test_cleanup_stops_and_deletes_the_recording(live):
     assert wait_until(frames_saved(1))
 
 
+
+def test_session_end_stops_the_recording_before_deleting(live):
+    """The exit and signal paths call session_end directly, not the cleanup tool."""
+    server.open_viewer(open_browser=False)
+    folder = Path(server.start_recording(fps=15)["folder"])
+    rec = server._live["recorder"]
+    assert wait_until(frames_saved(3))
+    cleanup.session_end()
+    assert not rec.running and recording.current() is None and server._live["recorder"] is None
+    time.sleep(0.2)
+    assert not folder.exists()
+
+
 FPS, N = 10, 20
 
 

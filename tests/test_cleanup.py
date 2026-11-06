@@ -181,6 +181,36 @@ def test_deleted_when_the_mcp_server_ends(tmp_path, end):
     p.wait(20)
     assert not os.path.exists(path)
 
+
+def test_a_recording_is_stopped_and_deleted_when_the_server_is_killed(tmp_path):
+    """SIGTERM while recording: the recorder stops before its folder is deleted."""
+    script = textwrap.dedent("""
+        import sys, numpy as np
+        from benchsight import server
+        from benchsight.feed import LiveFeed
+        rng = np.random.default_rng(0)
+        server.LiveFeed = lambda cam=0: LiveFeed(cam, fps=30, source=lambda: rng.integers(0, 255, (240, 320, 3), dtype=np.uint8))
+        server._make_tracker = lambda feed: (_ for _ in ()).throw(RuntimeError("off"))
+        server.open_viewer(open_browser=False)
+        folder = server.start_recording(fps=15)["folder"]
+        open(sys.argv[1], "w").write(folder)
+        server.main()
+    """)
+    note, store = tmp_path / "path.txt", tmp_path / "store"
+    env = {k: v for k, v in os.environ.items() if k != "BENCHSIGHT_KEEP"}
+    env.update(BENCHSIGHT_DIR=str(store), BENCHSIGHT_ACTIVE=str(tmp_path / "active-store"))
+    p = subprocess.Popen([sys.executable, "-c", script, str(note)], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    end_at = time.time() + 20
+    while not (note.exists() and note.read_text()) and time.time() < end_at:
+        time.sleep(0.05)
+    folder = note.read_text()
+    time.sleep(1.0)  # let it record some frames
+    assert len(os.listdir(folder)) > 3
+    p.send_signal(signal.SIGTERM)
+    p.wait(20)
+    assert not os.path.exists(folder)
+
 # ── benchsight clean ──
 
 def fill(store, n_old=2, n_new=2):
@@ -316,6 +346,41 @@ def test_a_recording_folder_with_foreign_files_stays(tmp_path):
         cleanup.record(p, store)
     assert cleanup.session_end()[0] == len(files)
     assert folder.is_dir() and (folder / "mine.txt").exists()
+
+
+
+def test_a_frame_written_during_the_delete_still_goes(tmp_path, monkeypatch):
+    """A recorder that wrote one more frame (and re-made its index) after its files were
+    listed: the folder gets a second pass, only for benchsight names."""
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    cleanup.record(folder, store)
+    for p in files:
+        cleanup.record(p, store)
+    real, once = cleanup._remove, []
+
+    def late(path):
+        got = real(path)
+        if path.name == "index.jsonl" and not once:
+            once.append(1)
+            (folder / "000003.jpg").write_bytes(b"r" * 10)
+            (folder / "index.jsonl").write_bytes(b"r" * 10)
+        return got
+    monkeypatch.setattr(cleanup, "_remove", late)
+    assert cleanup.session_end() == (len(files) + 2, 10 * (len(files) + 2))
+    assert not folder.exists()
+
+
+def test_before_end_hooks_run_first_and_never_block_deletion(tmp_path, monkeypatch):
+    monkeypatch.setattr(cleanup, "_before", [])
+    p = camera.save(img(), "look", store=tmp_path).path
+    seen = []
+    cleanup.before_end(lambda: seen.append(p.exists()))
+    cleanup.before_end(lambda: 1 / 0)
+    assert cleanup.session_end()[0] == 1 and seen == [True] and not p.exists()
+    monkeypatch.setenv("BENCHSIGHT_KEEP", "1")
+    cleanup.session_end()
+    assert seen == [True, False], "hooks run even when files are kept"
 
 
 def test_recording_lookalikes_are_never_touched(tmp_path):

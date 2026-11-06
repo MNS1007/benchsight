@@ -83,6 +83,9 @@ def _stop_recording() -> dict | None:
     return rec.stop() if rec is not None else None
 
 
+cleanup.before_end(_stop_recording)  # every session end (exit, signal, cleanup) stops it first
+
+
 @mcp.tool()
 def cameras() -> list[int]:
     """List camera indices that work on this machine."""
@@ -344,7 +347,6 @@ def cleanup_files() -> dict:
     """Delete the photos, annotated images, contact sheets, recordings and events file
     this session has saved so far (they are deleted anyway when the session ends). A
     recording in progress is stopped first. Returns how many files and bytes were freed."""
-    _stop_recording()
     n, freed = cleanup.session_end()
     return {"ok": True, "files": n, "bytes": freed, "freed": cleanup.human(freed)}
 
@@ -354,8 +356,7 @@ def main() -> None:
     try:
         mcp.run()  # returns when the client closes stdio
     finally:
-        _stop_recording()  # so no frame lands in a folder being deleted
-        cleanup.session_end()
+        cleanup.session_end()  # stops a recording first (before_end), then deletes
 
 
 if __name__ == "__main__":

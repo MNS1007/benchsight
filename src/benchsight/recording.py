@@ -113,7 +113,7 @@ def sample(index: list[dict], start_s: float | None = None, end_s: float | None 
 
 # ── the recorder ──
 
-_guard = threading.Lock()
+_guard = threading.RLock()  # reentrant: session end may stop a recording from a signal handler
 _current: "Recorder | None" = None
 
 

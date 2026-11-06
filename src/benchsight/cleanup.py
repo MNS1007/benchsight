@@ -34,6 +34,7 @@ BLOB = "mcp-benchsight-blob-"  # Claude Code's saved copies of this server's ima
 
 _lock = threading.RLock()  # reentrant: a signal handler may run while the main thread holds it
 _files: dict[Path, Path] = {}  # file -> its store, both resolved
+_before: list = []  # run before session end deletes anything, e.g. stop a recording
 _installed = False
 
 
@@ -109,6 +110,14 @@ def record(path: Path | str, store: Path | str | None = None) -> None:
         _files[path.resolve()] = store.resolve()
 
 
+def before_end(fn) -> None:
+    """Run fn() at the start of every session_end, before anything is deleted (e.g. stop
+    a recording, so no frame lands in a folder being deleted). Registered once."""
+    with _lock:
+        if fn not in _before:
+            _before.append(fn)
+
+
 def session_files() -> list[Path]:
     with _lock:
         return list(_files)
@@ -116,7 +125,15 @@ def session_files() -> list[Path]:
 
 def session_end() -> tuple[int, int]:
     """Delete this session's files now. Returns (files deleted, bytes freed). Safe to
-    call again (the record is cleared) and if the store is gone."""
+    call again (the record is cleared) and if the store is gone. Runs the before_end
+    hooks first, also when the files are kept."""
+    with _lock:
+        hooks = list(_before)
+    for fn in hooks:
+        try:
+            fn()
+        except Exception:  # a failing hook must never stop the deletion
+            pass
     if os.environ.get("BENCHSIGHT_KEEP", "") not in ("", "0"):
         return 0, 0
     with _lock:
@@ -134,8 +151,24 @@ def session_end() -> tuple[int, int]:
         if size is not None:
             n, freed = n + 1, freed + size
     for folder in folders:
+        if _rmdir(folder):
+            continue
+        for p in _folder_files(folder):  # a frame written while we were deleting: one more pass
+            size = _remove(p)
+            if size is not None:
+                n, freed = n + 1, freed + size
         _rmdir(folder)
     return n, freed
+
+
+def _folder_files(folder: Path) -> list[Path]:
+    """The frames and index in a recording folder (only those names), else []."""
+    if not rec_folder(folder):
+        return []
+    try:
+        return [p for p in folder.iterdir() if in_rec(p)]
+    except OSError:
+        return []
 
 
 def store_files(store: Path | str, older_than_s: float | None = 24 * 3600, now: float | None = None) -> list[tuple[Path, int]]:
