@@ -368,3 +368,17 @@ def test_a_failing_first_frame_does_not_leave_a_recording_on(tmp_path):
     b = recording.Recorder(Feed(), tmp_path, clock=Clock()).start(background=False)
     assert recording.current() is b
     b.stop()
+
+
+def test_flicker_on_a_low_contrast_scene_is_not_activity():
+    """A smooth, dim scene whose spread crosses the flat cutoff as the light flickers:
+    one frame reads as flat, the next does not. That is not motion."""
+    y, x = np.mgrid[0:360, 0:640]
+    base = 5.0 * np.sin(x / 40.0) * np.cos(y / 30.0)
+    dim, bright = [cv2.cvtColor(np.clip((100 + base) * g, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                   for g in (0.65, 1.35)]
+    a, b = recording.small_gray(dim), recording.small_gray(bright)
+    assert not a.any() and b.any(), "the scene must straddle the flat cutoff"
+    act = recording.Activity()
+    scores = [act.update(f) for f in [dim, bright] * 8]
+    assert max(scores) == 0.0, scores

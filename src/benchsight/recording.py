@@ -48,8 +48,10 @@ def small_gray(frame: np.ndarray, roi: tuple[float, float, float, float] | None 
 
 def activity(prev: np.ndarray | None, curr: np.ndarray) -> float:
     """Percent (0-100) of the roi that changed between two small_gray images, with tiny
-    speckle ignored. 0 for the first frame or when the sizes differ."""
-    if prev is None or prev.shape != curr.shape or (not curr.any() and not prev.any()):
+    speckle ignored. 0 for the first frame, when the sizes differ, or when either image is
+    flat: a dim, low-contrast roi under a flickering light crosses the flat cutoff every
+    other frame, and comparing flat with not-flat would read as the whole roi changing."""
+    if prev is None or prev.shape != curr.shape or not curr.any() or not prev.any():
         return 0.0
     changed = (np.abs(curr - prev) > DIFF).astype(np.uint8)
     changed = cv2.morphologyEx(changed, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
