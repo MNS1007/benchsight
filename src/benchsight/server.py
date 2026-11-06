@@ -352,6 +352,7 @@ def main() -> None:
     try:
         mcp.run()  # returns when the client closes stdio
     finally:
+        _stop_recording()  # so no frame lands in a folder being deleted
         cleanup.session_end()
 
 
