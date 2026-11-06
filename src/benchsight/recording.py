@@ -8,14 +8,24 @@ for review are always picked evenly in time, never by activity.
 """
 from __future__ import annotations
 
+import json
+import math
+import threading
+import time
+from pathlib import Path
+
 import cv2
 import numpy as np
 
-from . import camera
+from . import camera, cleanup
 
 ACTIVITY_WIDTH = 160  # activity is scored on a grayscale this wide
 DIFF = 0.6  # a pixel changed if it moved this many standard deviations (after normalizing)
 MIN_BLOB = 0.002  # changed areas smaller than this share of the roi are speckle
+ACTIVE = 1.0  # timeline(): a frame is active when at least this percent of the roi changed
+MAX_SECONDS = 900.0  # hard cap on one recording
+MAX_FPS = 15.0
+INDEX = cleanup.INDEX
 
 
 def small_gray(frame: np.ndarray, roi: tuple[float, float, float, float] | None = None,
@@ -99,3 +109,249 @@ def sample(index: list[dict], start_s: float | None = None, end_s: float | None 
             seen.add(k)
             out.append(inside[k])
     return out
+
+
+# ── the recorder ──
+
+_guard = threading.Lock()
+_current: "Recorder | None" = None
+
+
+def current() -> "Recorder | None":
+    """The recording in progress, if any (only one at a time)."""
+    with _guard:
+        return _current
+
+
+class Recorder:
+    """Saves the live feed's latest frame fps times a second as small JPEGs in
+    <store>/rec-YYYYmmdd-HHMMSS/, with one index.jsonl line per frame. Every file is
+    registered with cleanup, so it goes when the session ends. Stops by itself after
+    max_seconds (at most MAX_SECONDS), or when the feed stops."""
+
+    def __init__(self, feed, store: Path | str, fps: float = 8, max_side: int = 640,
+                 max_seconds: float = 300, quality: int = 70,
+                 roi: tuple[float, float, float, float] | None = None, clock=time.time):
+        if roi is not None:
+            roi = tuple(float(v) for v in roi)
+            if len(roi) != 4:
+                raise ValueError("roi is [x1, y1, x2, y2] as fractions 0-1")
+            camera.crop(np.zeros((10, 10), np.uint8), roi)  # raises if the box is empty
+        self.feed, self.store = feed, Path(store)
+        self.fps = min(MAX_FPS, max(0.5, float(fps)))
+        self.max_seconds = min(MAX_SECONDS, max(1.0, float(max_seconds)))
+        self.max_side = int(min(1280, max(160, max_side)))
+        self.quality = int(min(95, max(30, quality)))
+        self.roi, self.clock = roi, clock
+        self.folder: Path | None = None
+        self.index: list[dict] = []
+        self.reason = ""  # why it stopped: "stopped", "cap" or "feed"
+        self._activity = Activity(roi)
+        self._start = self._end = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.folder is not None and not self.reason
+
+    def elapsed(self) -> float:
+        if self.folder is None:
+            return 0.0
+        return round((self._end if self.reason else self.clock()) - self._start, 3)
+
+    def start(self, background: bool = True) -> "Recorder":
+        """Make the folder, take the first frame now and keep going in a thread.
+        background=False leaves the ticking to the caller (capture()), for tests."""
+        global _current
+        with _guard:
+            if self.folder is not None:
+                raise RuntimeError("this recorder already ran; make a new one")
+            if _current is not None and _current.running:
+                raise RuntimeError(f"already recording into {_current.folder}; stop that first")
+            if not getattr(self.feed, "running", True):
+                raise RuntimeError("the camera is not running")
+            self.folder = self._make_folder()
+            _current = self
+        self._start = self.clock()
+        self._next = self._start
+        if self.capture() and background:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def _make_folder(self) -> Path:
+        self.store.mkdir(parents=True, exist_ok=True)
+        base = f"rec-{time.strftime('%Y%m%d-%H%M%S')}"
+        for k in range(1, 1000):
+            folder = self.store / (base if k == 1 else f"{base}-{k}")
+            try:
+                folder.mkdir()
+            except FileExistsError:
+                continue
+            cleanup.record(folder, self.store)
+            return folder
+        raise RuntimeError("could not make a recording folder")
+
+    def capture(self) -> bool:
+        """Save one frame now. False once the recording should stop (cap reached or
+        feed gone); the reason is set and nothing more is written."""
+        if self.reason:
+            return False
+        now = self.clock()
+        if now - self._start >= self.max_seconds:
+            return self._finish("cap", self._start + self.max_seconds)
+        if not getattr(self.feed, "running", True):
+            return self._finish("feed", now)
+        frame = self.feed.latest()
+        if frame is None:
+            return True
+        small = camera.fit(frame, self.max_side)
+        score = self._activity.update(small)
+        ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+        if not ok:
+            return True
+        i = len(self.index)
+        path = self.folder / f"{i:06d}.jpg"
+        path.write_bytes(buf.tobytes())  # the frame first, so the index never names a missing file
+        cleanup.record(path, self.store)
+        entry = {"i": i, "t": round(now - self._start, 3), "file": path.name, "activity": score}
+        index = self.folder / INDEX
+        with index.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        if i == 0:
+            cleanup.record(index, self.store)
+        self.index.append(entry)
+        return True
+
+    def _finish(self, reason: str, end: float) -> bool:
+        global _current
+        self.reason, self._end = reason, end
+        with _guard:
+            if _current is self:
+                _current = None
+        return False
+
+    def _run(self) -> None:
+        period = 1.0 / self.fps
+        while not self._stop.is_set():
+            self._next += period
+            wait = self._next - self.clock()
+            if wait < -period:  # fell behind: do not burst to catch up
+                self._next, wait = self.clock(), 0.0
+            if self._stop.wait(max(0.0, wait)):
+                break
+            try:
+                if not self.capture():
+                    break
+            except Exception as err:  # disk full, folder deleted: stop and say why
+                self._finish(f"error: {err}", self.clock())
+                break
+
+    def stop(self) -> dict:
+        """Stop (if still going) and return the summary. Safe to call again."""
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        if not self.reason and self.folder is not None:
+            self._finish("stopped", self.clock())
+        return self.summary()
+
+    def summary(self) -> dict:
+        """What was recorded: folder, frames, duration, the activity hint."""
+        acts = [e["activity"] for e in self.index]
+        return {"folder": str(self.folder) if self.folder else None, "frames": len(self.index),
+                "duration_s": self.elapsed(), "fps": self.fps, "max_seconds": self.max_seconds,
+                "roi": list(self.roi) if self.roi else None, "stopped": self.reason or None,
+                "activity": timeline(self.index), "peak_activity": max(acts, default=0.0)}
+
+    def status(self) -> dict:
+        """For the viewer's REC badge."""
+        return {"recording": self.running, "elapsed_s": self.elapsed(), "max_seconds": self.max_seconds,
+                "frames": len(self.index), "folder": self.folder.name if self.folder else None}
+
+
+# ── reading recordings back ──
+
+def load_index(folder: Path | str) -> list[dict]:
+    """A recording's frames, in order. A half-written last line (still recording) is skipped."""
+    out = []
+    try:
+        lines = (Path(folder) / INDEX).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and {"t", "file"} <= e.keys():
+            out.append(e)
+    return out
+
+
+def recordings(store: Path | str) -> list[Path]:
+    """The store's recording folders, oldest first."""
+    def key(p: Path):
+        parts = p.name.split("-")
+        return parts[1], parts[2], int(parts[3]) if len(parts) > 3 else 1
+    try:
+        found = [p for p in Path(store).iterdir() if cleanup.rec_folder(p)]
+    except OSError:
+        return []
+    return sorted(found, key=key)
+
+
+def find(store: Path | str, name: str | None = None) -> Path:
+    """The named recording folder in the store (rec-...), else the newest one."""
+    if name:
+        given = Path(name.rstrip("/"))
+        folder = Path(store) / given.name  # a bare name, or a path to one in this store
+        path_given = str(given) != given.name
+        if not cleanup.rec_folder(folder) or (path_given and given.resolve() != folder.resolve()):
+            raise ValueError(f"no recording {name!r} in {store}")
+        return folder
+    found = recordings(store)
+    if not found:
+        raise ValueError("no recordings yet: start_recording first")
+    return found[-1]
+
+
+def labeled_sheet(items: list[tuple[float, np.ndarray]], max_side: int = 1600) -> np.ndarray:
+    """One contact sheet of (seconds, frame) pairs, each tile labeled with its number and
+    time ("3  4.2s"), fitted inside max_side. Tiles are sized first so labels stay readable."""
+    if not items:
+        raise ValueError("no frames")
+    n = len(items)
+    cols = min(n, math.ceil(math.sqrt(n * 4 / 3)))
+    rows = math.ceil(n / cols)
+    h, w = items[0][1].shape[:2]
+    tile_w = max(32, min(max_side // cols, int(max_side / rows * w / h), w))
+    tile_h = max(24, round(tile_w * h / w))
+    tiles = [cv2.resize(f, (tile_w, tile_h), interpolation=cv2.INTER_AREA) for _, f in items]
+    labels = [f"{k}  {t:.1f}s" for k, (t, _) in enumerate(items, 1)]
+    return camera.contact_sheet(tiles, cols=cols, labels=labels)
+
+
+def review(folder: Path | str, start_s: float | None = None, end_s: float | None = None,
+           frames: int = 12, max_side: int = 1600, store: Path | None = None) -> tuple[camera.Shot, list[dict]]:
+    """A labeled contact sheet of evenly spaced frames from a recording (it may still be
+    going), saved with camera.save so cleanup deletes it. Returns (shot, the entries shown)."""
+    folder = Path(folder)
+    index = load_index(folder)
+    if not index:
+        raise ValueError(f"{folder.name} has no frames yet")
+    picked = sample(index, start_s, end_s, frames)
+    if not picked:
+        raise ValueError(f"no frames between {start_s}s and {end_s}s; the recording runs "
+                         f"{index[0]['t']:.1f}s to {index[-1]['t']:.1f}s")
+    items = []
+    for e in picked:
+        img = cv2.imread(str(folder / Path(e["file"]).name))
+        if img is not None:
+            items.append((float(e["t"]), img))
+    if not items:
+        raise ValueError(f"the frames of {folder.name} are gone")
+    sheet = labeled_sheet(items, max_side)
+    shot = camera.save(sheet, "review") if store is None else camera.save(sheet, "review", store=store)
+    return shot, picked
