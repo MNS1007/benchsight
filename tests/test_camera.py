@@ -42,3 +42,32 @@ def test_server_registers_the_tools():
     tools = asyncio.run(server.mcp.list_tools())
     assert {t.name for t in tools} == {"cameras", "look", "watch", "point", "open_viewer", "track", "objects", "untrack",
                                        "annotate", "clear_annotations", "close_viewer", "cleanup"}
+
+
+def test_find_store_prefers_dir_then_env_then_local_then_active(tmp_path, monkeypatch):
+    active, served = tmp_path / "active-store", tmp_path / "server" / ".benchsight"
+    monkeypatch.setattr(camera, "ACTIVE", active)
+    monkeypatch.delenv("BENCHSIGHT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)  # no ./.benchsight here
+    assert camera.find_store() == camera.STORE  # nothing marked yet
+    served.mkdir(parents=True)
+    assert camera.mark_active(served) == served.resolve()
+    assert camera.find_store() == served.resolve()
+    assert camera.find_store(tmp_path / "x") == tmp_path / "x"
+    (tmp_path / ".benchsight").mkdir()
+    assert camera.find_store() == camera.STORE  # a local store wins over the marked one
+    monkeypatch.setenv("BENCHSIGHT_DIR", str(tmp_path / "env"))
+    assert camera.find_store() == camera.STORE
+
+
+def test_cli_events_reads_the_active_store(tmp_path, monkeypatch, capsys):
+    from benchsight import cli
+    served = tmp_path / "server" / ".benchsight"
+    served.mkdir(parents=True)
+    (served / "events.jsonl").write_text('{"event": "still"}\n')
+    monkeypatch.setattr(camera, "ACTIVE", tmp_path / "active-store")
+    monkeypatch.delenv("BENCHSIGHT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    camera.mark_active(served)
+    cli.main(["events"])
+    assert '"still"' in capsys.readouterr().out

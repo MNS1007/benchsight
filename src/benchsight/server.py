@@ -123,7 +123,9 @@ def point(x: float, y: float, label: str = "", max_side: int = 1280) -> Image:
 def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
     """Open the live viewer: a small local window with the camera feed, where your
     annotations appear on top. Use it when guiding the builder through a physical step.
-    Returns the local URL. The camera stays on until close_viewer."""
+    Returns the local URL, and with tracking on a `watch` command: run it under a
+    background monitor to be woken by events (object lost or found, scene changed, still).
+    The camera stays on until close_viewer."""
     if _live["viewer"] is not None:
         return {"ok": True, "url": _live["viewer"].url, "note": "already open"}
     feed = LiveFeed(cam)
@@ -142,7 +144,13 @@ def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
     _live.update(feed=feed, viewer=viewer, tracker=tracker)
     if open_browser:
         webbrowser.open(url)
-    return {"ok": True, "url": url, "note": note}
+    out = {"ok": True, "url": url, "note": note}
+    if tracker is not None:
+        store = camera.mark_active()
+        out["events_file"] = str(store / "events.jsonl")
+        out["watch"] = f"benchsight events --follow --dir '{store}'"
+        out["note"] += " To wake on changes, run the watch command under a background monitor."
+    return out
 
 
 @mcp.tool()

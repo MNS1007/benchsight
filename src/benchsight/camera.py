@@ -13,6 +13,35 @@ import numpy as np
 from . import cleanup
 
 STORE = Path(os.environ.get("BENCHSIGHT_DIR", ".benchsight"))  # where photos are kept
+# The MCP server's ./.benchsight is relative to the folder the agent started it in, which
+# is rarely the folder a shell runs `benchsight events` from. The server writes its store's
+# absolute path here when the viewer opens, so the CLI finds the live events file.
+ACTIVE = Path(os.environ.get("BENCHSIGHT_ACTIVE", Path.home() / ".cache" / "benchsight" / "active-store"))
+
+
+def mark_active(store: Path = STORE) -> Path:
+    """Record store (made absolute) as the one the running server writes to."""
+    store = store.resolve()
+    try:
+        ACTIVE.parent.mkdir(parents=True, exist_ok=True)
+        ACTIVE.write_text(str(store) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return store
+
+
+def find_store(explicit: Path | None = None) -> Path:
+    """The store a CLI command should read: --dir, else BENCHSIGHT_DIR, else ./.benchsight
+    if it exists here, else the one the server last marked active."""
+    if explicit is not None:
+        return explicit
+    if "BENCHSIGHT_DIR" in os.environ or STORE.exists():
+        return STORE
+    try:
+        marked = Path(ACTIVE.read_text(encoding="utf-8").strip())
+    except OSError:
+        return STORE
+    return marked if marked.is_absolute() else STORE
 KEEP_SECONDS = 24 * 3600  # saved frames older than this are deleted on the next capture
 # (a backstop: each session deletes its own files when it ends, see cleanup.py)
 

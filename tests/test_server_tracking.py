@@ -40,6 +40,7 @@ def live(monkeypatch, tmp_path):
     save = camera.save
     monkeypatch.setattr(server.camera, "save", lambda img, name: save(img, name, store=tmp_path))
     monkeypatch.setattr(server, "_last", None)
+    monkeypatch.setattr(camera, "ACTIVE", tmp_path / "active-store")
     n = cv2.getNumThreads()
     yield bench
     server.close_viewer()
@@ -144,3 +145,13 @@ def test_viewer_opens_without_tracking_if_the_tracker_fails(live, monkeypatch):
         server.annotate([{"type": "text", "at": [0.5, 0.5], "text": "x", "anchor": "plate"}])
     with pytest.raises(ValueError, match="tracking is off: no tracker"):
         server.track([{"label": "plate", "box": live.box()}])
+
+
+def test_open_viewer_gives_a_watch_command_for_the_events_file(live, tmp_path):
+    """The server's store is relative to its own folder; the agent's shell is elsewhere.
+    open_viewer names the absolute events file and marks it active for the CLI."""
+    out = server.open_viewer(open_browser=False)
+    store = camera.STORE.resolve()
+    assert out["events_file"] == str(store / "events.jsonl")
+    assert out["watch"] == f"benchsight events --follow --dir '{store}'"
+    assert (tmp_path / "active-store").read_text().strip() == str(store)

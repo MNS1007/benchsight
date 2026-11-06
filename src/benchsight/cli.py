@@ -28,7 +28,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="keep printing new events, one JSON line each (run it under a background monitor)")
     e.add_argument("-n", "--lines", type=int, default=None,
                    help="how many past events to print first (default 20; 0 with --follow)")
-    e.add_argument("--dir", type=Path, default=None, help="the benchsight store (default BENCHSIGHT_DIR or ./.benchsight)")
+    e.add_argument("--dir", type=Path, default=None, help="the benchsight store (default BENCHSIGHT_DIR, else ./.benchsight if it exists, "
+                        "else the one the running server marked active)")
     c = sub.add_parser("clean", help="delete saved benchsight photos and events (default: older than 24 h)")
     c.add_argument("--all", action="store_true", help="delete every benchsight file, whatever its age")
     c.add_argument("--older-than", type=float, default=24.0, metavar="HOURS",
@@ -45,7 +46,7 @@ def main(argv: list[str] | None = None) -> None:
         print(camera.list_cameras())
     elif a.cmd == "events":
         from . import events
-        path = (a.dir or camera.STORE) / "events.jsonl"
+        path = camera.find_store(a.dir) / "events.jsonl"
         if a.follow:
             try:
                 events.follow(path, sys.stdout, backlog=a.lines or 0)
