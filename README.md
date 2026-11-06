@@ -128,8 +128,8 @@ I'm assembling <my SO-101 arm's gripper>. Use the benchsight tools to guide me:
 4. Guide me one step at a time with annotate, anchoring each drawing to its part:
    red for wrong, green for right, a yellow arrow for where to move something, and a
    one-line caption. Check your drawings with look(with_annotations=True).
-5. While I work, if you're Claude Code, run `benchsight events --follow` with your
-   background Monitor tool, and look again when an event arrives instead of taking
+5. While I work, if you're Claude Code, run the `watch` command that open_viewer
+   returns (`benchsight events --follow --dir ...`) with your background Monitor tool, and look again when an event arrives instead of taking
    photos in a loop. Use objects() for quick position checks.
 6. Check each step against the build docs and say which step you're on.
 7. When I say I'm done: stop the Monitor, call close_viewer so the camera turns off,
@@ -426,7 +426,7 @@ For step-by-step guidance, the agent can open a live view of your bench and draw
 - Drawings without an anchor are fixed to the camera image: if you move the camera, ask the agent to look again and redraw.
 - `untrack`, or a new `track` call that leaves a part out, also removes the drawings anchored to it.
 
-**Let the agent wake when something changes (Claude Code).** Instead of taking photos in a loop, the agent can run `benchsight events --follow` with Claude Code's background **Monitor** tool. The command prints one JSON line when something happens on the bench, and each line wakes the agent, which then takes a look and redraws. Ask for it in plain words: "Guide me through mounting the gripper, and watch the bench while I work."
+**Let the agent wake when something changes (Claude Code).** Instead of taking photos in a loop, the agent can run the `watch` command that `open_viewer` returns (`benchsight events --follow --dir <store>`) with Claude Code's background **Monitor** tool. The command prints one JSON line when something happens on the bench, and each line wakes the agent, which then takes a look and redraws. Ask for it in plain words: "Guide me through mounting the gripper, and watch the bench while I work."
 
 Each line looks like this:
 
@@ -435,8 +435,9 @@ Each line looks like this:
 ```
 
 - Events: `object_lost`, `object_found`, `scene_changed` (the camera was bumped, something big moved, or the view was blocked) and `still` (the bench went calm after a burst of motion).
-- Lines are debounced to about one every 5 seconds; everything in between is merged into the next line, so the agent isn't woken more often than that.
-- Events are written only while the viewer is open, to `events.jsonl` in the photo folder. `benchsight events --follow` reads `./.benchsight` by default. If you set `BENCHSIGHT_DIR` for the server, the agent's shell does not see it: pass the same folder with `--dir`.
+- A stretch of motion (an arm being teleoperated, hands at work) gives one `scene_changed` when it starts and one `still` when it stops, not a wake-up every few seconds.
+- Lines are debounced to at most one every 5 seconds; everything in between is merged into the next line.
+- Events are written only while the viewer is open, to `events.jsonl` in the photo folder. The server's folder is relative to where the agent started it, so `open_viewer` returns the absolute path (`events_file`) and a ready `watch` command. Without `--dir`, `benchsight events` reads `BENCHSIGHT_DIR`, else `./.benchsight` if it exists, else the folder the running server recorded in `~/.cache/benchsight/active-store`.
 - A Monitor runs for 30 minutes at most. The agent re-arms it if the job takes longer. You can also watch the events yourself in a second terminal with the same command.
 
 **Privacy:** the viewer is served on 127.0.0.1 only, so other devices on your network can't see it. It streams only while open.
@@ -570,7 +571,7 @@ benchsight looks for lost parts again by themselves, but a part that turned a lo
 To save CPU, parts take turns updating. Set `BENCHSIGHT_CPU=0` to update every part every frame, if your machine has CPU to spare.
 
 **`benchsight events --follow` prints nothing**
-Events are written only while the viewer is open, and only when something happens. Check that it reads the right folder: it uses `./.benchsight` unless you pass `--dir` (the server's `BENCHSIGHT_DIR` is not seen by other shells). `benchsight events` without `--follow` prints the last 20 lines.
+Events are written only while the viewer is open, and only when something happens. Check that it reads the right folder: use the `watch` command from `open_viewer`, which has the absolute `--dir`. A stray `./.benchsight` in the folder you run it from wins over the server's folder. `benchsight events` without `--follow` prints the last 20 lines.
 
 **The photo folder is getting big**
 Run `benchsight clean --dry-run` to see what is there, then `benchsight clean` (or `--all`). See [Disk space and cleanup](#disk-space-and-cleanup).
