@@ -42,7 +42,7 @@ def test_server_registers_the_tools():
     tools = asyncio.run(server.mcp.list_tools())
     assert {t.name for t in tools} == {"cameras", "look", "watch", "point", "open_viewer", "track", "objects", "untrack",
                                        "annotate", "clear_annotations", "close_viewer", "cleanup",
-                                       "start_recording", "stop_recording", "review"}
+                                       "start_recording", "stop_recording", "review", "review_video"}
 
 
 def test_find_store_prefers_dir_then_env_then_local_then_active(tmp_path, monkeypatch):

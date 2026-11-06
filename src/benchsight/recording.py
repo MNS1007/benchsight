@@ -357,3 +357,45 @@ def review(folder: Path | str, start_s: float | None = None, end_s: float | None
     sheet = labeled_sheet(items, max_side)
     shot = camera.save(sheet, "review") if store is None else camera.save(sheet, "review", store=store)
     return shot, picked
+
+
+def video_frames(path: Path | str, start_s: float | None = None, end_s: float | None = None,
+                 frames: int = 12, max_side: int = 640) -> list[tuple[float, np.ndarray]]:
+    """(seconds, frame) pairs spread evenly over [start_s, end_s] of a video file (e.g. a
+    LeRobot episode mp4), found by seeking. Each time is that of the frame actually read.
+    Nothing is copied: frames are decoded in memory only."""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise ValueError(f"no video file at {path}")
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"could not open {path} as a video")
+        fps, count = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fps <= 0 or count <= 0:
+            raise ValueError(f"could not read the frame rate or length of {path}")
+        last = (count - 1) / fps
+        lo = 0.0 if start_s is None else min(max(0.0, float(start_s)), last)
+        hi = last if end_s is None else min(max(0.0, float(end_s)), last)
+        if lo > hi:
+            raise ValueError(f"start_s is after end_s; the video runs 0.0s to {last:.1f}s")
+        picks = sorted({min(count - 1, round(t * fps)) for t in np.linspace(lo, hi, max(1, frames))})
+        out = []
+        for k in picks:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, k)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                out.append((k / fps, camera.fit(frame, max_side)))
+        if not out:
+            raise ValueError(f"could not decode frames of {path}")
+        return out
+    finally:
+        cap.release()
+
+
+def review_video(path: Path | str, start_s: float | None = None, end_s: float | None = None,
+                 frames: int = 12, max_side: int = 1600) -> camera.Shot:
+    """A labeled contact sheet of evenly spaced frames from a video file, saved with
+    camera.save so cleanup deletes it. The video itself is never copied."""
+    sheet = labeled_sheet(video_frames(path, start_s, end_s, frames), max_side)
+    return camera.save(sheet, "review")

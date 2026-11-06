@@ -299,6 +299,17 @@ def review(start_s: float | None = None, end_s: float | None = None, frames: int
 
 
 @mcp.tool()
+def review_video(path: str, start_s: float | None = None, end_s: float | None = None, frames: int = 12,
+                 max_side: int = 1600) -> Image:
+    """Like review, but from any local video file (an absolute path), e.g. a LeRobot
+    dataset episode mp4: frames spread evenly over [start_s, end_s] (default: all of it),
+    each labeled with its number and time in the video. Zoom the same way. frames: 2-24.
+    Needs no viewer; the video is read in place, never copied."""
+    shot = rec_mod.review_video(path, start_s, end_s, max(2, min(int(frames), 24)), max(320, min(int(max_side), 2400)))
+    return Image(data=shot.jpeg, format="jpeg")
+
+
+@mcp.tool()
 def close_viewer() -> dict:
     """Close the live viewer, stop tracking and any recording, and turn the camera off.
     The recording stays on disk for review until the session ends or cleanup."""

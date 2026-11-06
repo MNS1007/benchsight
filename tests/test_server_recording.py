@@ -2,6 +2,7 @@
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -137,3 +138,59 @@ def test_cleanup_stops_and_deletes_the_recording(live):
     assert not (live / Path(folder).name).exists()
     server.start_recording(fps=15)  # a new one can start after cleanup
     assert wait_until(frames_saved(1))
+
+
+FPS, N = 10, 20
+
+
+@pytest.fixture
+def video(tmp_path):
+    """A 2 s mp4 whose frame k is gray level 10 * k, so a tile shows which frame it is."""
+    path = tmp_path / "episode.mp4"
+    out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (160, 120))
+    if not out.isOpened():
+        pytest.skip("no mp4 encoder here")
+    for k in range(N):
+        out.write(np.full((120, 160, 3), 10 * k, np.uint8))
+    out.release()
+    cap = cv2.VideoCapture(str(path))
+    ok = cap.isOpened() and int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == N
+    cap.release()
+    if not ok or path.stat().st_size == 0:
+        pytest.skip("no mp4 decoder here")
+    return path
+
+
+def test_review_video_samples_evenly_and_labels_times(video, monkeypatch, tmp_path):
+    save = camera.save
+    monkeypatch.setattr(server.camera, "save", lambda img, name: save(img, name, store=tmp_path / "store"))
+    shown = []
+    real = recording.labeled_sheet
+    monkeypatch.setattr(recording, "labeled_sheet", lambda items, m: shown.append(items) or real(items, m))
+    before = {p.name for p in tmp_path.iterdir()}
+
+    assert server.review_video(str(video), frames=5).data[:2] == b"\xff\xd8"
+    times = [t for t, _ in shown[0]]
+    assert times == [0.0, 0.5, 1.0, 1.4, 1.9]
+    for t, f in shown[0]:
+        assert abs(float(f.mean()) - 10 * round(t * FPS)) < 4, "the tile is the frame its label names"
+
+    server.review_video(str(video), start_s=0.5, end_s=1.0, frames=100)
+    times = [t for t, _ in shown[1]]
+    assert times == [0.5, 0.6, 0.7, 0.8, 0.9, 1.0], "inside the window, deduped"
+    server.review_video(str(video), start_s=1.5, end_s=99, frames=1)
+    assert [t for t, _ in shown[2]] == [1.5, 1.9], "frames at least 2, end clamped to the last frame"
+
+    assert {p.name for p in tmp_path.iterdir()} - before == {"store"}, "no copy of the video"
+    assert all(p.name.endswith("-review.jpg") for p in (tmp_path / "store").iterdir())
+
+
+def test_review_video_rejects_bad_paths(video, tmp_path):
+    with pytest.raises(ValueError, match="no video file"):
+        server.review_video(str(tmp_path / "missing.mp4"))
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"not a video")
+    with pytest.raises(ValueError, match="could not"):
+        server.review_video(str(junk))
+    with pytest.raises(ValueError, match="start_s is after end_s"):
+        server.review_video(str(video), start_s=1.5, end_s=0.5)
