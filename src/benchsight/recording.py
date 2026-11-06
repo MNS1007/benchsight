@@ -196,6 +196,8 @@ class Recorder:
     def capture(self) -> bool:
         """Save one frame now. False once the recording should stop (cap reached or
         feed gone); the reason is set and nothing more is written."""
+        if self.folder is None:
+            raise RuntimeError("recorder not started")
         if self.reason:
             return False
         now = self.clock()

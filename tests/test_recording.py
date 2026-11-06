@@ -220,7 +220,8 @@ def test_settings_are_clamped():
         recording.Recorder(Feed(), "x", roi=[0.5, 0.5, 0.2, 0.9])
 
 
-def test_only_one_recording_at_a_time(tmp_path):
+def test_only_one_recording_at_a_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording.time, "strftime", lambda fmt: "20260101-000000")  # same second
     a = recording.Recorder(Feed(), tmp_path, clock=Clock()).start(background=False)
     assert recording.current() is a
     with pytest.raises(RuntimeError, match="already recording"):
@@ -228,11 +229,16 @@ def test_only_one_recording_at_a_time(tmp_path):
     a.stop()
     assert recording.current() is None
     b = recording.Recorder(Feed(), tmp_path, clock=Clock()).start(background=False)
-    assert b.folder != a.folder and b.folder.name.startswith(a.folder.name[:19])
+    assert a.folder.name == "rec-20260101-000000" and b.folder.name == "rec-20260101-000000-2"
     with pytest.raises(RuntimeError, match="already ran"):
         a.start()
     b.stop()
     assert a.stop() == a.summary(), "stop is safe to call again"
+
+
+def test_capture_before_start_says_so(tmp_path):
+    with pytest.raises(RuntimeError, match="not started"):
+        recording.Recorder(Feed(), tmp_path).capture()
 
 
 def test_recorder_stops_when_the_feed_does(tmp_path):
