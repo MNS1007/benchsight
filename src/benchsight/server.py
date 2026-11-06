@@ -293,6 +293,10 @@ def stop_recording() -> dict:
     out["note"] = ("Call review() for an even overview of the whole recording, then "
                    "review(start_s, end_s) to zoom on the moments that matter, and describe what happened. "
                    "The activity stretches are only a hint of where things moved.")
+    if out["stopped"] == "stalled":
+        last = out["frames"] and rec_mod.load_index(out["folder"])[-1]["t"]
+        out["note"] = (f"The camera stopped sending new frames after {last:.1f} s (frozen or unplugged), "
+                       "so nothing after that was recorded: tell the builder. ") + out["note"]
     return out
 
 

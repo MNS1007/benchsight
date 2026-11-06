@@ -251,6 +251,30 @@ def test_recorder_stops_when_the_feed_does(tmp_path):
         recording.Recorder(feed, tmp_path).start()
 
 
+
+def test_a_frozen_camera_is_not_recorded_as_a_still_scene(tmp_path):
+    """LiveFeed keeps its last frame when the camera stops giving new ones (seq stops)."""
+    bg, frozen = bench(), []
+    feed = LiveFeed(fps=60, source=lambda: None if frozen else bg)
+    feed.start()
+    try:
+        clock = Clock()
+        rec = recording.Recorder(feed, tmp_path, clock=clock).start(background=False)
+        frozen.append(True)
+        time.sleep(0.1)  # let a frame in flight land
+        clock.t += 0.125
+        rec.capture()
+        n = len(rec.index)
+        for _ in range(3):
+            clock.t += 0.125
+            assert rec.capture() and len(rec.index) == n, "the same frame is not saved again"
+        clock.t += recording.STALL_S
+        assert not rec.capture() and rec.stop()["stopped"] == "stalled"
+        assert recording.current() is None
+    finally:
+        feed.stop()
+
+
 def test_the_thread_records_at_about_fps(tmp_path):
     bg = bench()
     feed = LiveFeed(fps=30, source=lambda: bg)

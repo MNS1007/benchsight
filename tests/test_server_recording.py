@@ -130,6 +130,18 @@ def test_stop_after_the_cap_still_gives_the_summary(live, monkeypatch):
     assert out["stopped"] == "cap" and out["max_seconds"] == 0.3 and out["frames"] >= 2
 
 
+
+def test_a_frozen_camera_stops_the_recording_and_says_so(live, monkeypatch):
+    server.open_viewer(open_browser=False)
+    monkeypatch.setattr(recording, "STALL_S", 0.3)
+    server.start_recording(fps=15)
+    assert wait_until(frames_saved(2))
+    monkeypatch.setattr(server._live["feed"], "_source", lambda: None)  # frozen: seq stops
+    assert wait_until(lambda: not server._live["recorder"].running)
+    out = server.stop_recording()
+    assert out["stopped"] == "stalled" and "stopped sending new frames" in out["note"]
+
+
 def test_close_viewer_stops_the_recording(live):
     server.open_viewer(open_browser=False)
     server.start_recording(fps=15)

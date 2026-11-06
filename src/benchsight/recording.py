@@ -25,6 +25,7 @@ MIN_BLOB = 0.002  # changed areas smaller than this share of the roi are speckle
 ACTIVE = 1.0  # timeline(): a frame is active when at least this percent of the roi changed
 MAX_SECONDS = 900.0  # hard cap on one recording
 MAX_FPS = 15.0
+STALL_S = 3.0  # no new camera frame for this long: the camera froze or was unplugged
 INDEX = cleanup.INDEX
 
 
@@ -127,7 +128,8 @@ class Recorder:
     """Saves the live feed's latest frame fps times a second as small JPEGs in
     <store>/rec-YYYYmmdd-HHMMSS/, with one index.jsonl line per frame. Every file is
     registered with cleanup, so it goes when the session ends. Stops by itself after
-    max_seconds (at most MAX_SECONDS), or when the feed stops."""
+    max_seconds (at most MAX_SECONDS), or when the feed stops. A frame the feed already gave
+    (same feed.seq) is never saved twice, and no new frame for STALL_S stops it as "stalled"."""
 
     def __init__(self, feed, store: Path | str, fps: float = 8, max_side: int = 640,
                  max_seconds: float = 300, quality: int = 70,
@@ -145,9 +147,11 @@ class Recorder:
         self.roi, self.clock = roi, clock
         self.folder: Path | None = None
         self.index: list[dict] = []
-        self.reason = ""  # why it stopped: "stopped", "cap" or "feed"
+        self.reason = ""  # why it stopped: "stopped", "cap", "feed", "stalled" or "error: ..."
         self._activity = Activity(roi)
         self._start = self._end = 0.0
+        self._seq: int | None = None  # the feed.seq of the last frame saved
+        self._fresh = 0.0  # when the feed last gave a new frame
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -174,7 +178,7 @@ class Recorder:
             self.folder = self._make_folder()
             _current = self
         self._start = self.clock()
-        self._next = self._start
+        self._next = self._fresh = self._start
         try:
             if self.capture() and background:
                 self._thread = threading.Thread(target=self._run, daemon=True)
@@ -209,6 +213,11 @@ class Recorder:
             return self._finish("cap", self._start + self.max_seconds)
         if not getattr(self.feed, "running", True):
             return self._finish("feed", now)
+        seq = getattr(self.feed, "seq", None)  # read first: a newer frame may come with it
+        if seq is not None and seq == self._seq:  # nothing new since the last frame saved
+            if now - self._fresh >= STALL_S:
+                return self._finish("stalled", now)
+            return True
         frame = self.feed.latest()
         if frame is None:
             return True
@@ -228,6 +237,7 @@ class Recorder:
         if i == 0:
             cleanup.record(index, self.store)
         self.index.append(entry)
+        self._seq, self._fresh = seq, now
         return True
 
     def _finish(self, reason: str, end: float) -> bool:
