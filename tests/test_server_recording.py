@@ -194,3 +194,14 @@ def test_review_video_rejects_bad_paths(video, tmp_path):
         server.review_video(str(junk))
     with pytest.raises(ValueError, match="start_s is after end_s"):
         server.review_video(str(video), start_s=1.5, end_s=0.5)
+
+
+def test_the_viewer_badge_follows_the_recording(live):
+    server.open_viewer(open_browser=False)
+    viewer = server._live["viewer"]
+    assert viewer.rec() == {"recording": False}
+    server.start_recording(fps=15)
+    rec = viewer.rec()
+    assert rec["recording"] is True and rec["folder"] == server._live["recorder"].folder.name
+    server.stop_recording()
+    assert viewer.rec() == {"recording": False}

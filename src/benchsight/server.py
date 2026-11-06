@@ -71,6 +71,12 @@ def _jpeg(img, name):
     return Image(data=camera.save(img, name).jpeg, format="jpeg")
 
 
+def _rec_status() -> dict | None:
+    """The recording's status for the viewer's REC badge, or None."""
+    rec = rec_mod.current()
+    return rec.status() if rec is not None else None
+
+
 def _stop_recording() -> dict | None:
     """Stop the recording if there is one (it may have stopped by itself). Its summary, or None."""
     rec, _live["recorder"] = _live["recorder"], None
@@ -149,7 +155,7 @@ def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
         tracker, note = None, note + f" Tracking is off: {err}"
         _live["tracker_error"] = str(err)
     port = int(os.environ.get("BENCHSIGHT_PORT", "0"))
-    viewer = Viewer(feed, overlay, port=port, tracker=tracker)
+    viewer = Viewer(feed, overlay, port=port, tracker=tracker, recording=_rec_status)
     url = viewer.start()
     _live.update(feed=feed, viewer=viewer, tracker=tracker)
     if open_browser:
