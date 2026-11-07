@@ -9,6 +9,7 @@ import pytest
 
 from benchsight.feed import LiveFeed
 from benchsight.overlay import Overlay, clean, render
+from benchsight import viewer as viewer_mod
 from benchsight.viewer import Viewer
 
 
@@ -159,3 +160,43 @@ def test_viewer_pushes_anchored_positions_only_when_they_change():
         stop.set()
         v.stop()
         feed.stop()
+
+
+def test_viewer_shows_a_rec_badge_only_while_recording(monkeypatch):
+    monkeypatch.setattr(viewer_mod, "REC_POLL", 0.05)
+    feed = LiveFeed(source=frame, fps=20)
+    feed.start()
+    status = {"recording": False}
+    v = Viewer(feed, Overlay(), recording=lambda: dict(status))
+    url = v.start()
+    got, stop = [], threading.Event()
+    t = threading.Thread(target=sse, args=(url, got, stop), daemon=True)
+    try:
+        page = urllib.request.urlopen(url, timeout=5).read().decode()
+        assert 'id="rec" hidden' in page and "REC" in page
+        t.start()
+        time.sleep(0.3)
+        assert [e for e, _ in got] == ["rec", "message"] and got[0][1] == {"recording": False}
+        status.update(recording=True, elapsed_s=1.5, max_seconds=300, frames=12, folder="rec-20261106-101010")
+        time.sleep(0.3)
+        status["elapsed_s"] = 2.5  # the browser runs the clock: nothing is sent for this
+        time.sleep(0.3)
+        status["recording"] = False
+        time.sleep(0.3)
+        recs = [d for e, d in got if e == "rec"]
+        assert [r["recording"] for r in recs] == [False, True, False], got
+        assert recs[1]["elapsed_s"] == 1.5 and recs[1]["max_seconds"] == 300
+    finally:
+        stop.set()
+        v.stop()
+        feed.stop()
+
+
+def test_a_failing_recording_status_never_breaks_the_viewer():
+    def broken():
+        raise RuntimeError("gone")
+    v = Viewer(None, Overlay(), recording=broken)
+    try:
+        assert v.rec() == {"recording": False}
+    finally:
+        v.httpd.server_close()

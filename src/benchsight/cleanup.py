@@ -8,7 +8,10 @@ for sessions that were killed hard.
 
 Deletion is deliberately narrow, because BENCHSIGHT_DIR can point anywhere: only regular
 files directly in the store whose names benchsight makes (20261105-101320-123-look.jpg,
-events.jsonl) are ever deleted, never symlinks, folders or anything else. In the agent's
+events.jsonl) are ever deleted, never symlinks or anything else. Recordings are the one
+kind of folder: rec-20261105-101320/ directly in the store, holding 000000.jpg ... and
+index.jsonl. Only those names are deleted inside it, and the folder itself only once it is
+empty (rmdir, never a recursive delete). In the agent's
 own cache, only Claude Code's saved copies of benchsight images
 (~/.claude/projects/.../tool-results/mcp-benchsight-blob-*) are touched.
 """
@@ -24,16 +27,54 @@ from pathlib import Path
 
 PHOTO = re.compile(r"^\d{8}-\d{6}-\d{3}-[a-z0-9_-]+\.jpg$")  # camera.save's names
 EVENTS = "events.jsonl"
+REC = re.compile(r"^rec-\d{8}-\d{6}(-\d+)?$")  # a recording's folder (recording.py)
+FRAME = re.compile(r"^\d{6}\.jpg$")  # a recorded frame, inside a REC folder
+INDEX = "index.jsonl"  # a recording's frame list, inside a REC folder
 BLOB = "mcp-benchsight-blob-"  # Claude Code's saved copies of this server's images
 
 _lock = threading.RLock()  # reentrant: a signal handler may run while the main thread holds it
 _files: dict[Path, Path] = {}  # file -> its store, both resolved
+_before: list = []  # run before session end deletes anything, e.g. stop a recording
 _installed = False
 
 
 def ours(path: Path) -> bool:
     """Is this a name benchsight writes into its store?"""
     return path.name == EVENTS or bool(PHOTO.match(path.name))
+
+
+def rec_folder(path: Path) -> bool:
+    """Is this a recording folder (a real folder, not a link) named the way benchsight names them?"""
+    try:
+        return bool(REC.match(path.name)) and not path.is_symlink() and path.is_dir()
+    except OSError:
+        return False
+
+
+def in_rec(path: Path) -> bool:
+    """Is this a file name benchsight writes inside a recording folder?"""
+    return bool(REC.match(path.parent.name)) and (path.name == INDEX or bool(FRAME.match(path.name)))
+
+
+def _allowed(path: Path, store: Path) -> bool:
+    """May session end delete this file? A benchsight name directly in the store, or a
+    recording's frame or index in a recording folder directly in the store."""
+    if path.parent == store:
+        return ours(path)
+    return path.parent.parent == store and in_rec(path) and rec_folder(path.parent)
+
+
+def _rmdir(path: Path) -> bool:
+    """Remove an empty recording folder. Never anything else, never a non-empty one."""
+    if not rec_folder(path):
+        return False
+    try:
+        path.rmdir()
+    except OSError:
+        return False
+    with _lock:
+        _files.pop(path.resolve(), None)
+    return True
 
 
 def _size(path: Path) -> int | None:
@@ -60,12 +101,21 @@ def _remove(path: Path) -> int | None:
 
 
 def record(path: Path | str, store: Path | str | None = None) -> None:
-    """Remember a file this process wrote, to delete at session end. store defaults to
-    the file's folder; only a benchsight-named file directly in it will be deleted."""
+    """Remember a file (or a recording folder) this process wrote, to delete at session
+    end. store defaults to the file's folder; only a benchsight-named file directly in it,
+    or in a recording folder directly in it, will be deleted."""
     path = Path(path)
     store = Path(store) if store is not None else path.parent
     with _lock:
         _files[path.resolve()] = store.resolve()
+
+
+def before_end(fn) -> None:
+    """Run fn() at the start of every session_end, before anything is deleted (e.g. stop
+    a recording, so no frame lands in a folder being deleted). Registered once."""
+    with _lock:
+        if fn not in _before:
+            _before.append(fn)
 
 
 def session_files() -> list[Path]:
@@ -75,24 +125,56 @@ def session_files() -> list[Path]:
 
 def session_end() -> tuple[int, int]:
     """Delete this session's files now. Returns (files deleted, bytes freed). Safe to
-    call again (the record is cleared) and if the store is gone."""
+    call again (the record is cleared) and if the store is gone. Runs the before_end
+    hooks first, also when the files are kept."""
+    with _lock:
+        hooks = list(_before)
+    for fn in hooks:
+        try:
+            fn()
+        except Exception:  # a failing hook must never stop the deletion
+            pass
     if os.environ.get("BENCHSIGHT_KEEP", "") not in ("", "0"):
         return 0, 0
     with _lock:
         items = list(_files.items())
         _files.clear()
     n = freed = 0
+    folders = []
     for path, store in items:
-        if path.parent != store or not ours(path):  # never outside the store, never foreign names
+        if path.parent == store and REC.match(path.name):
+            folders.append(path)  # after its files are gone
+            continue
+        if not _allowed(path, store):  # never outside the store, never foreign names
             continue
         size = _remove(path)
         if size is not None:
             n, freed = n + 1, freed + size
+    for folder in folders:
+        if _rmdir(folder):
+            continue
+        for p in _folder_files(folder):  # a frame written while we were deleting: one more pass
+            size = _remove(p)
+            if size is not None:
+                n, freed = n + 1, freed + size
+        _rmdir(folder)
     return n, freed
 
 
+def _folder_files(folder: Path) -> list[Path]:
+    """The frames and index in a recording folder (only those names), else []."""
+    if not rec_folder(folder):
+        return []
+    try:
+        return [p for p in folder.iterdir() if in_rec(p)]
+    except OSError:
+        return []
+
+
 def store_files(store: Path | str, older_than_s: float | None = 24 * 3600, now: float | None = None) -> list[tuple[Path, int]]:
-    """benchsight files in the store, older than older_than_s (None: all). [(path, bytes)]."""
+    """benchsight files in the store, older than older_than_s (None: all), including the
+    files in its recording folders. [(path, bytes)]. delete() removes a recording folder
+    once its last file goes."""
     store = Path(store)
     now = time.time() if now is None else now
     out = []
@@ -100,8 +182,8 @@ def store_files(store: Path | str, older_than_s: float | None = 24 * 3600, now: 
         entries = list(store.iterdir())
     except OSError:
         return []
-    for p in sorted(entries):
-        if not ours(p):
+    for p in sorted(_with_recordings(entries)):
+        if not (ours(p) if p.parent == store else in_rec(p)):
             continue
         size = _size(p)
         if size is None:
@@ -113,6 +195,18 @@ def store_files(store: Path | str, older_than_s: float | None = 24 * 3600, now: 
             except OSError:
                 continue
         out.append((p, size))
+    return out
+
+
+def _with_recordings(entries: list[Path]) -> list[Path]:
+    """The store's entries plus the files inside its recording folders (one level only)."""
+    out = list(entries)
+    for p in entries:
+        if rec_folder(p):
+            try:
+                out += list(p.iterdir())
+            except OSError:
+                pass
     return out
 
 
@@ -147,7 +241,8 @@ def agent_cache_files(older_than_s: float | None = None, now: float | None = Non
 
 
 def delete(files: list[tuple[Path, int]]) -> tuple[int, int]:
-    """Delete files from store_files or agent_cache_files. Returns (files, bytes)."""
+    """Delete files from store_files or agent_cache_files. Returns (files, bytes). A
+    recording folder left empty is removed too (it does not count as a file)."""
     n = freed = 0
     for p, _ in files:
         size = _remove(p)
@@ -155,6 +250,8 @@ def delete(files: list[tuple[Path, int]]) -> tuple[int, int]:
             n, freed = n + 1, freed + size
             with _lock:
                 _files.pop(p.resolve(), None)
+            if in_rec(p):
+                _rmdir(p.parent)
     return n, freed
 
 

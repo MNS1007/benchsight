@@ -123,8 +123,9 @@ def test_camera_bump_then_still(tmp_path):
     assert got[1]["t"] - got[0]["t"] >= events.COOLDOWN - 1e-6, "debounced"
 
 
-def test_hands_in_view_wake_at_most_every_5_s(tmp_path):
-    """Something big moving for 20 s: about 4 wake-ups, not 300."""
+def test_hands_in_view_wake_once_then_still(tmp_path):
+    """Something big moving for 20 s (an arm being teleoperated): one scene_changed when
+    it starts and one still when it stops, not a wake-up every 5 s."""
     sc, ev = Scene(), events.Events(tmp_path / "e.jsonl")
     frames = []
     for i in range(20 * FPS):
@@ -132,11 +133,25 @@ def test_hands_in_view_wake_at_most_every_5_s(tmp_path):
         x = 100 + int(300 * abs(np.sin(i / 6)))
         f[150:350, x:x + 120] = (170, 200, 240)  # a bright hand-sized block sweeping about
         frames.append(f)
+    frames += [sc.frame(200) for _ in range(6 * FPS)]  # then it stops
     run(ev, frames, 0.0)
     got = lines(tmp_path / "e.jsonl")
-    assert 2 <= len(got) <= 5, got
-    assert all(b["t"] - a["t"] >= events.COOLDOWN - 1e-6 for a, b in zip(got, got[1:]))
-    assert {g["event"] for g in got} == {"scene_changed"}
+    assert [g["event"] for g in got] == ["scene_changed", "still"], got
+
+
+def test_a_second_burst_of_motion_wakes_again(tmp_path):
+    sc, ev = Scene(), events.Events(tmp_path / "e.jsonl")
+    frames = []
+    for burst in range(2):
+        for i in range(4 * FPS):
+            f = sc.frame(200)
+            x = 100 + int(300 * abs(np.sin(i / 6)))
+            f[150:350, x:x + 120] = (170, 200, 240)
+            frames.append(f)
+        frames += [sc.frame(200) for _ in range(8 * FPS)]
+    run(ev, frames, 0.0)
+    got = [g["event"] for g in lines(tmp_path / "e.jsonl")]
+    assert got == ["scene_changed", "still", "scene_changed", "still"], got
 
 
 def test_the_tracker_writes_lost_and_found(tmp_path):

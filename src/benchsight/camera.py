@@ -13,6 +13,35 @@ import numpy as np
 from . import cleanup
 
 STORE = Path(os.environ.get("BENCHSIGHT_DIR", ".benchsight"))  # where photos are kept
+# The MCP server's ./.benchsight is relative to the folder the agent started it in, which
+# is rarely the folder a shell runs `benchsight events` from. The server writes its store's
+# absolute path here when the viewer opens, so the CLI finds the live events file.
+ACTIVE = Path(os.environ.get("BENCHSIGHT_ACTIVE", Path.home() / ".cache" / "benchsight" / "active-store"))
+
+
+def mark_active(store: Path = STORE) -> Path:
+    """Record store (made absolute) as the one the running server writes to."""
+    store = store.resolve()
+    try:
+        ACTIVE.parent.mkdir(parents=True, exist_ok=True)
+        ACTIVE.write_text(str(store) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return store
+
+
+def find_store(explicit: Path | None = None) -> Path:
+    """The store a CLI command should read: --dir, else BENCHSIGHT_DIR, else ./.benchsight
+    if it exists here, else the one the server last marked active."""
+    if explicit is not None:
+        return explicit
+    if "BENCHSIGHT_DIR" in os.environ or STORE.exists():
+        return STORE
+    try:
+        marked = Path(ACTIVE.read_text(encoding="utf-8").strip())
+    except OSError:
+        return STORE
+    return marked if marked.is_absolute() else STORE
 KEEP_SECONDS = 24 * 3600  # saved frames older than this are deleted on the next capture
 # (a backstop: each session deletes its own files when it ends, see cleanup.py)
 
@@ -71,10 +100,14 @@ def crop(img: np.ndarray, box: tuple[float, float, float, float] | None) -> np.n
     return img[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
 
 
-def contact_sheet(frames: list[np.ndarray], cols: int = 3, label: bool = True) -> np.ndarray:
-    """Several frames in one image, numbered, so the agent sees a sequence in one look."""
+def contact_sheet(frames: list[np.ndarray], cols: int = 3, label: bool = True,
+                  labels: list[str] | None = None) -> np.ndarray:
+    """Several frames in one image, numbered, so the agent sees a sequence in one look.
+    labels replaces the numbers with a text per tile (e.g. "3  4.2s"), on a dark band."""
     if not frames:
         raise ValueError("no frames")
+    if labels is not None and len(labels) != len(frames):
+        raise ValueError("one label per frame")
     h, w = frames[0].shape[:2]
     cols = min(cols, len(frames))
     rows = (len(frames) + cols - 1) // cols
@@ -83,9 +116,21 @@ def contact_sheet(frames: list[np.ndarray], cols: int = 3, label: bool = True) -
         f = cv2.resize(f, (w, h)) if f.shape[:2] != (h, w) else f
         r, c = divmod(i, cols)
         sheet[r * h:(r + 1) * h, c * w:(c + 1) * w] = f
-        if label:
+        if labels is not None:
+            _tag(sheet, labels[i], c * w, r * h, w)
+        elif label:
             cv2.putText(sheet, str(i + 1), (c * w + 8, r * h + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
     return sheet
+
+
+def _tag(img: np.ndarray, text: str, x: int, y: int, tile_w: int) -> None:
+    """Write text at a tile's top left on a dark band, sized to the tile, readable on any frame."""
+    scale = max(0.4, min(1.0, tile_w / 400))
+    thick = 1 if scale < 0.6 else 2
+    (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    pad = max(3, int(6 * scale))
+    cv2.rectangle(img, (x, y), (x + tw + 2 * pad, y + th + base + 2 * pad), (0, 0, 0), -1)
+    cv2.putText(img, text, (x + pad, y + pad + th), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255), thick, cv2.LINE_AA)
 
 
 def mark(img: np.ndarray, x: float, y: float, text: str = "") -> np.ndarray:

@@ -4,7 +4,8 @@ Photos are taken only when a tool asks. The live viewer (open_viewer) is a small
 window with the camera feed, where the agent draws arrows, circles, boxes, freehand
 strokes and text to guide the builder. It runs only while open and serves 127.0.0.1 only.
 While it is open, objects the agent boxes with track() are followed frame by frame on the
-CPU, and shapes anchored to them move with them.
+CPU, and shapes anchored to them move with them. While it is open, start_recording keeps
+small frames of the bench so the agent can review afterwards what the builder did.
 Images are saved in ./.benchsight (or BENCHSIGHT_DIR) and deleted when the session ends
 (BENCHSIGHT_KEEP=1 keeps them), or after 24 hours at the latest.
 """
@@ -17,6 +18,7 @@ import webbrowser
 from mcp.server.mcpserver import Image, MCPServer
 
 from . import camera, cleanup
+from . import recording as rec_mod  # tools have a `recording` argument
 from .events import Events
 from .feed import LiveFeed
 from .overlay import Overlay, render, resolve
@@ -26,7 +28,8 @@ from .viewer import Viewer
 mcp = MCPServer("benchsight")
 _last = None  # the last full frame taken, for point() and track()
 overlay = Overlay()
-_live: dict = {"feed": None, "viewer": None, "tracker": None, "tracker_error": ""}
+_live: dict = {"feed": None, "viewer": None, "tracker": None, "tracker_error": "", "recorder": None,
+               "last_recording": None}  # the folder this session last recorded into, for review()
 _look_boxes: dict[str, list[float]] = {}  # tracked boxes as they were in the last look
 
 
@@ -67,6 +70,21 @@ def _frame(cam: int, warmup: int = 5):
 
 def _jpeg(img, name):
     return Image(data=camera.save(img, name).jpeg, format="jpeg")
+
+
+def _rec_status() -> dict | None:
+    """The recording's status for the viewer's REC badge, or None."""
+    rec = rec_mod.current()
+    return rec.status() if rec is not None else None
+
+
+def _stop_recording() -> dict | None:
+    """Stop the recording if there is one (it may have stopped by itself). Its summary, or None."""
+    rec, _live["recorder"] = _live["recorder"], None
+    return rec.stop() if rec is not None else None
+
+
+cleanup.before_end(_stop_recording)  # every session end (exit, signal, cleanup) stops it first
 
 
 @mcp.tool()
@@ -123,7 +141,11 @@ def point(x: float, y: float, label: str = "", max_side: int = 1280) -> Image:
 def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
     """Open the live viewer: a small local window with the camera feed, where your
     annotations appear on top. Use it when guiding the builder through a physical step.
-    Returns the local URL. The camera stays on until close_viewer."""
+    Returns the local URL, and with tracking on a `watch` command: run it under a
+    background monitor to be woken by events (object lost or found, scene changed, still).
+    To see what the builder does over a while, record and review: start_recording (roi
+    around the workspace), let them work, stop_recording, review(), then review(start_s,
+    end_s) to zoom. The camera stays on until close_viewer."""
     if _live["viewer"] is not None:
         return {"ok": True, "url": _live["viewer"].url, "note": "already open"}
     feed = LiveFeed(cam)
@@ -137,12 +159,18 @@ def open_viewer(cam: int = 0, open_browser: bool = True) -> dict:
         tracker, note = None, note + f" Tracking is off: {err}"
         _live["tracker_error"] = str(err)
     port = int(os.environ.get("BENCHSIGHT_PORT", "0"))
-    viewer = Viewer(feed, overlay, port=port, tracker=tracker)
+    viewer = Viewer(feed, overlay, port=port, tracker=tracker, recording=_rec_status)
     url = viewer.start()
     _live.update(feed=feed, viewer=viewer, tracker=tracker)
     if open_browser:
         webbrowser.open(url)
-    return {"ok": True, "url": url, "note": note}
+    out = {"ok": True, "url": url, "note": note}
+    if tracker is not None:
+        store = camera.mark_active()
+        out["events_file"] = str(store / "events.jsonl")
+        out["watch"] = f"benchsight events --follow --dir '{store}'"
+        out["note"] += " To wake on changes, run the watch command under a background monitor."
+    return out
 
 
 @mcp.tool()
@@ -228,27 +256,116 @@ def clear_annotations() -> dict:
 
 
 @mcp.tool()
+def start_recording(roi: list[float] | None = None, fps: float = 8, max_seconds: float = 300) -> dict:
+    """Record the bench while the builder works, to review it afterwards: you cannot
+    watch live video, but you can look back once they are done. Use it when the builder
+    says "watch this" or "start watching". Needs the viewer open (open_viewer); the
+    builder sees a red REC badge there. roi: [x1, y1, x2, y2] (fractions 0-1 of a recent
+    look) around the workspace, so the activity hint ignores the rest of the frame (all
+    frames are still saved whole). fps up to 15; it stops by itself after max_seconds
+    (at most 900). Then: stop_recording, review() for an overview, review(start_s, end_s)
+    to zoom on a moment."""
+    feed = _live["feed"]
+    if _live["viewer"] is None or feed is None or not feed.running:
+        raise ValueError("open the viewer first with open_viewer: the camera runs only while it is open")
+    if _live["recorder"] is not None and _live["recorder"].running:
+        raise ValueError(f"already recording into {_live['recorder'].folder.name}; call stop_recording first")
+    try:
+        rec = rec_mod.Recorder(feed, camera.STORE.resolve(), fps=fps, max_seconds=max_seconds, roi=roi).start()
+    except ValueError:
+        raise
+    except Exception as err:  # already recording, camera gone, disk full or read-only
+        raise ValueError(f"could not start recording: {err}") from err
+    _live["recorder"], _live["last_recording"] = rec, rec.folder
+    return {"ok": True, "folder": str(rec.folder), "fps": rec.fps, "max_seconds": rec.max_seconds,
+            "roi": list(rec.roi) if rec.roi else None,
+            "note": f"Recording (stops by itself after {rec.max_seconds:g} s). Let the builder work, "
+                    "then call stop_recording."}
+
+
+@mcp.tool()
+def stop_recording() -> dict:
+    """Stop the recording and say what was recorded: duration_s, frames, folder, and
+    activity: stretches [start_s, end_s] where the work area changed. Activity is a rough
+    hint only (it misses slow or small motion): review the whole recording evenly first."""
+    if _live["recorder"] is None:
+        raise ValueError("nothing is recording: start_recording first")
+    out = _stop_recording()
+    out["note"] = ("Call review() for an even overview of the whole recording, then "
+                   "review(start_s, end_s) to zoom on the moments that matter, and describe what happened. "
+                   "The activity stretches are only a hint of where things moved.")
+    if out["stopped"] == "stalled":
+        last = out["frames"] and rec_mod.load_index(out["folder"])[-1]["t"]
+        out["note"] = (f"The camera stopped sending new frames after {last:.1f} s (frozen or unplugged), "
+                       "so nothing after that was recorded: tell the builder. ") + out["note"]
+    return out
+
+
+@mcp.tool()
+def review(start_s: float | None = None, end_s: float | None = None, frames: int = 12,
+           max_side: int = 1600, recording: str | None = None) -> list[str | Image]:
+    """One sheet of frames from this session's last recording (or the named rec-... folder),
+    spread evenly over [start_s, end_s] (default: all of it), each labeled with its number
+    and time ("3  4.2s"), after a line naming the recording and the span shown. Start with
+    review() for the whole run, then zoom: review(4.0, 7.0) to see what happened between
+    4 s and 7 s. You pick the moments; frames are never chosen by activity. frames: 2-24.
+    Works while still recording, on what is saved so far."""
+    if recording:
+        folder = rec_mod.find(camera.STORE, recording)
+    elif _live["last_recording"] is not None:
+        folder = _live["last_recording"]
+    else:
+        raise ValueError("no recording in this session: start_recording first "
+                         "(or name an older one with recording='rec-...')")
+    shot, shown = rec_mod.review(folder, start_s, end_s, max(2, min(int(frames), 24)), max(320, min(int(max_side), 2400)))
+    index = rec_mod.load_index(folder)
+    rec = rec_mod.current()
+    going = " (still recording)" if rec is not None and rec.folder == folder else ""
+    head = (f"{folder.name}, started {rec_mod.started(folder)}: {len(shown)} frame{'s' if len(shown) != 1 else ''} from "
+            f"{shown[0]['t']:.1f}s to {shown[-1]['t']:.1f}s of {index[-1]['t']:.1f}s recorded{going}.")
+    return [head, Image(data=shot.jpeg, format="jpeg")]
+
+
+@mcp.tool()
+def review_video(path: str, start_s: float | None = None, end_s: float | None = None, frames: int = 12,
+                 max_side: int = 1600) -> Image:
+    """Like review, but from any local video file (an absolute path), e.g. a LeRobot
+    dataset episode mp4: frames spread evenly over [start_s, end_s] (default: all of it),
+    each labeled with its number and time in the video. Zoom the same way. frames: 2-24.
+    Needs no viewer; the video is read in place, never copied."""
+    shot = rec_mod.review_video(path, start_s, end_s, max(2, min(int(frames), 24)), max(320, min(int(max_side), 2400)))
+    return Image(data=shot.jpeg, format="jpeg")
+
+
+@mcp.tool()
 def close_viewer() -> dict:
-    """Close the live viewer, stop tracking and turn the camera off."""
+    """Close the live viewer, stop tracking and any recording, and turn the camera off.
+    The recording stays on disk for review until the session ends or cleanup."""
     viewer, feed, tracker = _live["viewer"], _live["feed"], _live["tracker"]
-    if tracker is not None:  # first: it reads the feed
+    summary = _stop_recording()  # first: it reads the feed
+    if tracker is not None:  # before the feed: it reads it
         tracker.stop()
     if viewer is not None:
         viewer.stop()
     if feed is not None:
         feed.stop()
-    _live.update(feed=None, viewer=None, tracker=None, tracker_error="")
+    _live.update(feed=None, viewer=None, tracker=None, tracker_error="", recorder=None)
     _look_boxes.clear()
     overlay.clear()
-    return {"ok": True, "note": "Viewer closed, camera off."}
+    out = {"ok": True, "note": "Viewer closed, camera off."}
+    if summary is not None:
+        out["recording"] = summary
+        out["note"] += " The recording was stopped; review() still works on it."
+    return out
 
 
 @mcp.tool(name="cleanup")
 def cleanup_files() -> dict:
-    """Delete the photos, annotated images, contact sheets and events file this session
-    has saved so far (they are deleted anyway when the session ends). Returns how many
-    files and bytes were freed."""
+    """Delete the photos, annotated images, contact sheets, recordings and events file
+    this session has saved so far (they are deleted anyway when the session ends). A
+    recording in progress is stopped first. Returns how many files and bytes were freed."""
     n, freed = cleanup.session_end()
+    _live["last_recording"] = None  # its frames are gone
     return {"ok": True, "files": n, "bytes": freed, "freed": cleanup.human(freed)}
 
 
@@ -257,7 +374,7 @@ def main() -> None:
     try:
         mcp.run()  # returns when the client closes stdio
     finally:
-        cleanup.session_end()
+        cleanup.session_end()  # stops a recording first (before_end), then deletes
 
 
 if __name__ == "__main__":

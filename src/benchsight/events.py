@@ -11,7 +11,8 @@ tool) turns each line into a wake-up:
                  changed a lot (hands, a part swapped)
   still          the scene has been stable for about 2 s after motion: a good moment to look
 
-Debounced: at most one line about every 5 s. Everything that happens inside that window
+Debounced: one scene_changed per stretch of motion (then "still" when it ends), and at
+most one line about every 5 s. Everything that happens inside that window
 is merged into the next line, newest state per object (a lost-then-found object inside
 one window nets out to nothing). One line looks like:
 
@@ -106,6 +107,7 @@ class Events:
         self._moving_since: float | None = None  # start of the current motion episode
         self._calm_since: float | None = None
         self._episode = 0.0  # motion in the current episode
+        self._reported = False  # this motion episode already woke the agent with scene_changed
         self._confident = False  # camera motion was recently well estimated
         self._low = 0  # low-confidence frames in a row after that
         self._lock = threading.Lock()
@@ -140,8 +142,12 @@ class Events:
         cam_px = mag if method != "none" and conf >= 0.5 and mag >= PX_FLOOR else 0.0
         amount = cam_px + diff
         reason = None
-        if self.scene.should_sample(now, amount):
+        if self.scene.should_sample(now, amount) and not self._reported:
+            # One scene_changed per motion episode: someone working in view (an arm
+            # moving, hands) would otherwise wake the agent every cooldown. The end of
+            # the episode brings "still", the moment worth a look.
             reason = "camera moved" if cam_px > diff else "picture changed"
+            self._reported = True
         # The view was blocked: motion was well estimated, then failed for several frames.
         # A plain desk never estimates well, so it never starts this.
         if method != "none":
@@ -169,6 +175,7 @@ class Events:
                 if self._episode >= EPISODE_MIN:
                     self.add("still", now, calm_s=self.still_after)
                 self._moving_since = self._calm_since = None
+                self._reported = False
         self.flush(now)
 
     # ── output ──

@@ -181,6 +181,36 @@ def test_deleted_when_the_mcp_server_ends(tmp_path, end):
     p.wait(20)
     assert not os.path.exists(path)
 
+
+def test_a_recording_is_stopped_and_deleted_when_the_server_is_killed(tmp_path):
+    """SIGTERM while recording: the recorder stops before its folder is deleted."""
+    script = textwrap.dedent("""
+        import sys, numpy as np
+        from benchsight import server
+        from benchsight.feed import LiveFeed
+        rng = np.random.default_rng(0)
+        server.LiveFeed = lambda cam=0: LiveFeed(cam, fps=30, source=lambda: rng.integers(0, 255, (240, 320, 3), dtype=np.uint8))
+        server._make_tracker = lambda feed: (_ for _ in ()).throw(RuntimeError("off"))
+        server.open_viewer(open_browser=False)
+        folder = server.start_recording(fps=15)["folder"]
+        open(sys.argv[1], "w").write(folder)
+        server.main()
+    """)
+    note, store = tmp_path / "path.txt", tmp_path / "store"
+    env = {k: v for k, v in os.environ.items() if k != "BENCHSIGHT_KEEP"}
+    env.update(BENCHSIGHT_DIR=str(store), BENCHSIGHT_ACTIVE=str(tmp_path / "active-store"))
+    p = subprocess.Popen([sys.executable, "-c", script, str(note)], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    end_at = time.time() + 20
+    while not (note.exists() and note.read_text()) and time.time() < end_at:
+        time.sleep(0.05)
+    folder = note.read_text()
+    time.sleep(1.0)  # let it record some frames
+    assert len(os.listdir(folder)) > 3
+    p.send_signal(signal.SIGTERM)
+    p.wait(20)
+    assert not os.path.exists(folder)
+
 # ── benchsight clean ──
 
 def fill(store, n_old=2, n_new=2):
@@ -281,3 +311,109 @@ def test_agent_cache_respects_age_and_is_off_by_default(tmp_path, monkeypatch, c
     assert all(p.exists() for p in ours)
     cli.main(["clean", "--dir", str(tmp_path / "store"), "--agent-cache"])
     assert not ours[0].exists() and ours[1].exists(), "a running session's young copies stay"
+
+
+# ── recording folders ──
+
+def rec(store, name="rec-20260101-000000", n=3, old=False):
+    """A recording folder as recording.py writes it."""
+    folder = store / name
+    folder.mkdir(parents=True)
+    files = [folder / f"{i:06d}.jpg" for i in range(n)] + [folder / "index.jsonl"]
+    for p in files:
+        p.write_bytes(b"r" * 10)
+        if old:
+            os.utime(p, (OLD, OLD))
+    return folder, files
+
+
+def test_session_end_deletes_a_recording_folder_and_only_its_files(tmp_path):
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    cleanup.record(folder, store)
+    for p in files:
+        cleanup.record(p, store)
+    assert cleanup.session_end() == (len(files), 10 * len(files))
+    assert not folder.exists()
+
+
+def test_a_recording_folder_with_foreign_files_stays(tmp_path):
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    (folder / "mine.txt").write_text("keep")
+    cleanup.record(folder, store)
+    for p in files + [folder / "mine.txt"]:
+        cleanup.record(p, store)
+    assert cleanup.session_end()[0] == len(files)
+    assert folder.is_dir() and (folder / "mine.txt").exists()
+
+
+
+def test_a_frame_written_during_the_delete_still_goes(tmp_path, monkeypatch):
+    """A recorder that wrote one more frame (and re-made its index) after its files were
+    listed: the folder gets a second pass, only for benchsight names."""
+    store = tmp_path / "store"
+    folder, files = rec(store)
+    cleanup.record(folder, store)
+    for p in files:
+        cleanup.record(p, store)
+    real, once = cleanup._remove, []
+
+    def late(path):
+        got = real(path)
+        if path.name == "index.jsonl" and not once:
+            once.append(1)
+            (folder / "000003.jpg").write_bytes(b"r" * 10)
+            (folder / "index.jsonl").write_bytes(b"r" * 10)
+        return got
+    monkeypatch.setattr(cleanup, "_remove", late)
+    assert cleanup.session_end() == (len(files) + 2, 10 * (len(files) + 2))
+    assert not folder.exists()
+
+
+def test_before_end_hooks_run_first_and_never_block_deletion(tmp_path, monkeypatch):
+    monkeypatch.setattr(cleanup, "_before", [])
+    p = camera.save(img(), "look", store=tmp_path).path
+    seen = []
+    cleanup.before_end(lambda: seen.append(p.exists()))
+    cleanup.before_end(lambda: 1 / 0)
+    assert cleanup.session_end()[0] == 1 and seen == [True] and not p.exists()
+    monkeypatch.setenv("BENCHSIGHT_KEEP", "1")
+    cleanup.session_end()
+    assert seen == [True, False], "hooks run even when files are kept"
+
+
+def test_recording_lookalikes_are_never_touched(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    deep = store / "sub" / "rec-20260101-000000"  # not directly in the store
+    deep.mkdir(parents=True)
+    (deep / "000000.jpg").write_bytes(b"x")
+    target = tmp_path / "elsewhere"  # a symlinked recording folder
+    target.mkdir()
+    (target / "000000.jpg").write_bytes(b"x")
+    (store / "rec-20260101-000001").symlink_to(target, target_is_directory=True)
+    odd = store / "recording-1"  # not a benchsight folder name
+    odd.mkdir()
+    (odd / "000000.jpg").write_bytes(b"x")
+    for p in (deep / "000000.jpg", store / "rec-20260101-000001" / "000000.jpg", odd / "000000.jpg",
+              deep, store / "rec-20260101-000001", odd):
+        cleanup.record(p, store)
+    assert cleanup.session_end() == (0, 0)
+    assert (deep / "000000.jpg").exists() and (target / "000000.jpg").exists() and (odd / "000000.jpg").exists()
+    names = {p.name for p, _ in cleanup.store_files(store, None)}
+    assert names == set()
+
+
+def test_store_files_and_clean_include_recordings(tmp_path, capsys):
+    from benchsight import cli
+    old_folder, old_files = rec(tmp_path, "rec-20200101-000000", old=True)
+    new_folder, new_files = rec(tmp_path, "rec-20990101-000000-2")
+    listed = {p for p, _ in cleanup.store_files(tmp_path)}
+    assert listed == set(old_files)
+    cli.main(["clean", "--dir", str(tmp_path)])
+    assert not old_folder.exists() and new_folder.is_dir()
+    assert "4 files deleted, 40 B freed" in capsys.readouterr().out
+    cli.main(["clean", "--dir", str(tmp_path), "--all"])
+    assert not new_folder.exists()
+    assert "4 files deleted" in capsys.readouterr().out

@@ -6,7 +6,8 @@ annotations drawn on top. It is served on 127.0.0.1 only and runs only while ope
   /overlay  the current annotations as JSON
   /events   annotation updates as server-sent events: the full state when the agent
             draws, then "pos" events with only the anchored shapes that moved
-            (about 12 a second at most, and only when something changed)
+            (about 12 a second at most, and only when something changed), and "rec"
+            events when a recording starts or stops, for the REC badge
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import cv2
 from .overlay import COLORS, resolve
 
 PUSH_HZ = 12  # most position updates per second sent to the browser
+REC_POLL = 0.5  # seconds between checks for a recording starting or stopping
 
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>benchsight</title>
@@ -36,9 +38,10 @@ PAGE = """<!DOCTYPE html>
   #caption{flex:1;font-size:17px}
   #dot{width:9px;height:9px;border-radius:50%;background:#e62828}
   #meta{color:#888;font-size:12px}
+  #rec{position:absolute;top:10px;left:10px;padding:3px 10px;border-radius:4px;background:rgba(0,0,0,.65);color:#ff3b3b;font-weight:700;font-variant-numeric:tabular-nums}
 </style></head>
 <body>
-<div id="wrap"><div id="stage"><img id="cam" src="/stream" alt="camera"><svg id="ov" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg></div></div>
+<div id="wrap"><div id="stage"><img id="cam" src="/stream" alt="camera"><svg id="ov" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg><div id="rec" hidden>&#9679; REC 0:00</div></div></div>
 <div id="bar"><div id="dot" title="camera on"></div><div id="caption">Waiting for the agent.</div><div id="meta">benchsight, local only</div></div>
 <script>
 const COLORS = __COLORS__;
@@ -86,13 +89,32 @@ ev.addEventListener('pos', m => {  // only the anchored shapes that moved
   for (const i in p.shapes) cur.shapes[i] = p.shapes[i];
   draw(cur, false);
 });
+const rec = document.getElementById('rec');
+let recTimer = null;
+ev.addEventListener('rec', m => {  // a recording started or stopped; the clock runs here
+  const r = JSON.parse(m.data);
+  clearInterval(recTimer);
+  rec.hidden = !r.recording;
+  if (!r.recording) return;
+  const t0 = Date.now() - r.elapsed_s * 1000;
+  const tick = () => {
+    const s = Math.floor(Math.min(r.max_seconds, (Date.now() - t0) / 1000));
+    rec.textContent = '\u25CF REC ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  };
+  tick();
+  recTimer = setInterval(tick, 500);
+});
 </script></body></html>"""
 
 
 class Viewer:
-    def __init__(self, feed, overlay, host: str = "127.0.0.1", port: int = 0, quality: int = 80, tracker=None):
-        """tracker: anything with objects() (a track.Tracker); anchored shapes follow it."""
+    def __init__(self, feed, overlay, host: str = "127.0.0.1", port: int = 0, quality: int = 80, tracker=None,
+                 recording=None):
+        """tracker: anything with objects() (a track.Tracker); anchored shapes follow it.
+        recording: a function giving the recording's status() (recording.Recorder) or
+        None, for the REC badge."""
         self.feed, self.overlay, self.quality, self.tracker = feed, overlay, quality, tracker
+        self.recording = recording
         viewer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -159,29 +181,45 @@ class Viewer:
         state = self.overlay.state() if state is None else state
         return resolve(state, self.tracker.objects(), digits=3) if self.tracker is not None else state
 
+    def rec(self) -> dict:
+        """The recording badge: {"recording": False}, or the recording's status."""
+        try:
+            status = self.recording() if self.recording is not None else None
+        except Exception:  # the badge never breaks the viewer
+            status = None
+        return status if status and status.get("recording") else {"recording": False}
+
     def _events(self, h):
         h.send_response(200)
         h.send_header("Content-Type", "text/event-stream")
         h.send_header("Cache-Control", "no-store")
         h.end_headers()
-        seen, sent, wrote = -1, [], time.time()
+        seen, sent, wrote, rec_sent = -1, [], time.time(), None
         while not self._stopped.is_set():
             follow = self.tracker is not None and self.overlay.anchored
-            state = self.overlay.wait(seen, timeout=1.0 / PUSH_HZ if follow else 15)
+            idle = REC_POLL if self.recording is not None else 15
+            state = self.overlay.wait(seen, timeout=1.0 / PUSH_HZ if follow else idle)
             if self._stopped.is_set():
                 break
+            out = b""
+            if self.recording is not None:
+                rec = self.rec()
+                if (rec["recording"], rec.get("folder")) != rec_sent:  # sent on start and stop only
+                    rec_sent = rec["recording"], rec.get("folder")
+                    out += b"event: rec\ndata: " + json.dumps(rec).encode() + b"\n\n"
             state = self.state(state)
             if state["version"] != seen:
                 seen, sent = state["version"], state["shapes"]
-                h.wfile.write(b"data: " + json.dumps(state).encode() + b"\n\n")
+                out += b"data: " + json.dumps(state).encode() + b"\n\n"
             else:
                 moved = {i: s for i, (s, old) in enumerate(zip(state["shapes"], sent)) if s != old}
                 if moved:
                     sent = state["shapes"]
-                    h.wfile.write(b"event: pos\ndata: " + json.dumps({"version": seen, "shapes": moved}).encode() + b"\n\n")
-                elif time.time() - wrote >= 15:
-                    h.wfile.write(b": keepalive\n\n")  # also detects a closed tab
-                else:
-                    continue
+                    out += b"event: pos\ndata: " + json.dumps({"version": seen, "shapes": moved}).encode() + b"\n\n"
+                elif not out and time.time() - wrote >= 15:
+                    out = b": keepalive\n\n"  # also detects a closed tab
+            if not out:
+                continue
+            h.wfile.write(out)
             wrote = time.time()
             h.wfile.flush()
